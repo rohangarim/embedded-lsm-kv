@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            cmake_flags: "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+            ctest_timeout: 600
+            env: "LSM_CI=1"
+          - name: debug
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug"
+            ctest_timeout: 900
+            env: "LSM_CI=1"
+          # ASan catches use-after-free of table handles and buffer overruns in
+          # the block parsers; UBSan catches the unaligned/overflow cases in the
+          # coding helpers.
+          - name: asan-ubsan
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DLSM_ASAN=ON"
+            ctest_timeout: 1800
+            env: "ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1:check_initialization_order=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
+          # TSan is the one that matters for the lock-free skip-list read path
+          # and for the version handoff between compaction and readers.
+          - name: tsan
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DLSM_TSAN=ON"
+            ctest_timeout: 1800
+            env: "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja ${{ matrix.cmake_flags }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: |
+          export ${{ matrix.env }}
+          ctest --test-dir build --output-on-failure --timeout ${{ matrix.ctest_timeout }}
+
+  crash-recovery:
+    name: fault injection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build
+
+      # Kills the writer process at a random point a few hundred times and
+      # asserts that every acknowledged write is readable after recovery.
+      - name: Randomized crash recovery
+        run: |
+          ./build/lsm_crash_harness \
+            --rounds 300 \
+            --writes 60000 \
+            --seed ${{ github.run_number }} \
+            --dir "${RUNNER_TEMP}/lsm_crash"
+
+  benchmark:
+    name: benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build
+
+      # Not a performance gate -- CI runners are far too noisy for that. This
+      # only proves the benchmark still runs every workload end to end.
+      - name: Run
+        run: |
+          ./build/lsm_bench --keys 100000 --ops 100000 --db "${RUNNER_TEMP}/bench_db"
