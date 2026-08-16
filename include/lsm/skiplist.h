@@ -149,7 +149,12 @@ typename SkipList<Comparator>::Node* SkipList<Comparator>::NewNode(
   for (int i = 0; i < height; ++i) {
     new (&node->next_slots()[i]) std::atomic<Node*>(nullptr);
   }
-  std::memcpy(mem + Node::KeyOffset(height), key.data(), key.size());
+  // memcpy declares both pointers non-null even for a zero-byte copy, and an
+  // empty string_view carries a null data(). The sentinel head node is built
+  // from exactly that, so guard rather than rely on it happening to work.
+  if (!key.empty()) {
+    std::memcpy(mem + Node::KeyOffset(height), key.data(), key.size());
+  }
   return node;
 }
 

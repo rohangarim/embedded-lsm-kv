@@ -35,7 +35,9 @@ inline std::string EncodeInternalKey(std::string_view user_key, SequenceNumber s
                                      ValueType type) {
   std::string out;
   out.reserve(user_key.size() + kTagSize);
-  out.append(user_key.data(), user_key.size());
+  // Empty user keys are legal, and an empty string_view's data() may be null,
+  // which append() is not required to tolerate.
+  if (!user_key.empty()) out.append(user_key.data(), user_key.size());
   PutFixed64(&out, PackTag(seq, type));
   return out;
 }

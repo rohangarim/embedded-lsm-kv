@@ -258,6 +258,90 @@ TEST(SSTable, RejectsTruncatedFile) {
   EXPECT_TRUE(s.IsCorruption()) << s.ToString();
 }
 
+// With a cache attached, repeated lookups of the same block should stop
+// touching the filesystem entirely.
+TEST(SSTable, BlockCacheServesRepeatedLookupsFromMemory) {
+  testing_support::ScopedTempDir dir("sst_cache");
+  Options options;
+  options.block_size_bytes = 1024;
+  const std::string path = dir.File("000001.sst");
+  { auto built = BuildTable(path, 5000, options); }
+
+  auto cache = std::make_shared<BlockCache>(4u << 20);
+  std::unique_ptr<Table> table;
+  ASSERT_TRUE(Table::Open(path, options, &table, cache, /*file_number=*/1).ok());
+
+  std::string value;
+  Status status;
+  // First pass populates the cache, second should be served entirely from it.
+  for (int pass = 0; pass < 2; ++pass) {
+    const uint64_t reads_before = table->blocks_read();
+    const uint64_t hits_before = table->block_cache_hits();
+    for (int i = 0; i < 5000; i += 5) {
+      ASSERT_TRUE(table->Get(testing_support::Key(i), kMaxSequenceNumber, &value,
+                             &status))
+          << i;
+      ASSERT_EQ(value, testing_support::Value(i));
+    }
+    const uint64_t reads = table->blocks_read() - reads_before;
+    const uint64_t hits = table->block_cache_hits() - hits_before;
+    if (pass == 0) {
+      EXPECT_GT(reads, 0u) << "cold pass should have gone to disk";
+    } else {
+      EXPECT_EQ(reads, 0u) << "warm pass should be entirely cache hits";
+      EXPECT_GT(hits, 0u);
+    }
+  }
+}
+
+TEST(SSTable, ResultsAreIdenticalWithAndWithoutTheCache) {
+  testing_support::ScopedTempDir dir("sst_cache_equiv");
+  Options options;
+  options.block_size_bytes = 512;
+  const std::string path = dir.File("000001.sst");
+  { auto built = BuildTable(path, 3000, options); }
+
+  auto cache = std::make_shared<BlockCache>(16 * 1024);  // Forces eviction.
+  std::unique_ptr<Table> cached, uncached;
+  ASSERT_TRUE(Table::Open(path, options, &cached, cache, 1).ok());
+  ASSERT_TRUE(Table::Open(path, options, &uncached).ok());
+
+  for (int i = 0; i < 3000; ++i) {
+    std::string a, b;
+    Status sa, sb;
+    const bool found_a =
+        cached->Get(testing_support::Key(i), kMaxSequenceNumber, &a, &sa);
+    const bool found_b =
+        uncached->Get(testing_support::Key(i), kMaxSequenceNumber, &b, &sb);
+    ASSERT_EQ(found_a, found_b) << i;
+    EXPECT_EQ(a, b) << i;
+  }
+  EXPECT_GT(cache->evictions(), 0u) << "test needs eviction to be exercised";
+}
+
+TEST(SSTable, IteratorIsCorrectWhileTheCacheEvictsUnderneathIt) {
+  testing_support::ScopedTempDir dir("sst_cache_iter");
+  Options options;
+  options.block_size_bytes = 256;
+  const std::string path = dir.File("000001.sst");
+  { auto built = BuildTable(path, 4000, options); }
+
+  // Capacity below one block, so every advance evicts what came before.
+  auto cache = std::make_shared<BlockCache>(128, 1);
+  std::unique_ptr<Table> table;
+  ASSERT_TRUE(Table::Open(path, options, &table, cache, 1).ok());
+
+  auto iter = table->NewIterator();
+  int count = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    ASSERT_EQ(ExtractUserKey(iter->key()), testing_support::Key(count));
+    ASSERT_EQ(iter->value(), testing_support::Value(count));
+    ++count;
+  }
+  EXPECT_EQ(count, 4000);
+  EXPECT_TRUE(iter->status().ok());
+}
+
 TEST(SSTable, HandlesValuesLargerThanABlock) {
   testing_support::ScopedTempDir dir("sst_bigvalue");
   Options options;

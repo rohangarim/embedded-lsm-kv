@@ -64,6 +64,7 @@ Status SyncFd(int fd) {
 struct Table::Stats {
   std::atomic<uint64_t> blocks_read{0};
   std::atomic<uint64_t> bloom_rejections{0};
+  std::atomic<uint64_t> cache_hits{0};
 };
 
 // ---------------------------------------------------------------- TableBuilder
@@ -191,7 +192,8 @@ void TableBuilder::Abandon() {
 // ----------------------------------------------------------------------- Table
 
 Status Table::Open(const std::string& path, const Options& options,
-                   std::unique_ptr<Table>* out) {
+                   std::unique_ptr<Table>* out,
+                   std::shared_ptr<BlockCache> cache, uint64_t file_number) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return PosixError("open " + path);
 
@@ -212,6 +214,8 @@ Status Table::Open(const std::string& path, const Options& options,
   table->fd_ = fd;
   table->file_size_ = file_size;
   table->verify_checksums_ = options.verify_checksums;
+  table->cache_ = std::move(cache);
+  table->file_number_ = file_number;
   table->stats_ = std::make_unique<Stats>();
 
   std::string footer;
@@ -231,17 +235,21 @@ Status Table::Open(const std::string& path, const Options& options,
   }
 
   // The index and the bloom filter are read once and held for the life of the
-  // table -- they are the two structures every lookup touches.
-  std::string bloom_contents;
-  s = table->ReadBlock(IndexEntry{"", bloom_offset, bloom_size}, &bloom_contents);
+  // table -- they are the two structures every lookup touches. They bypass the
+  // block cache precisely because they are already retained here; caching them
+  // would just take capacity away from data blocks.
+  BlockCache::Handle bloom_contents;
+  s = table->ReadBlock(IndexEntry{"", bloom_offset, bloom_size}, &bloom_contents,
+                       /*cacheable=*/false);
   if (!s.ok()) return s;
-  table->bloom_ = BloomFilter(std::move(bloom_contents));
+  table->bloom_ = BloomFilter(*bloom_contents);
 
-  std::string index_contents;
-  s = table->ReadBlock(IndexEntry{"", index_offset, index_size}, &index_contents);
+  BlockCache::Handle index_contents;
+  s = table->ReadBlock(IndexEntry{"", index_offset, index_size}, &index_contents,
+                       /*cacheable=*/false);
   if (!s.ok()) return s;
 
-  std::string_view rest(index_contents);
+  std::string_view rest(*index_contents);
   while (!rest.empty()) {
     std::string_view last_key;
     if (!GetLengthPrefixed(&rest, &last_key) || rest.size() < 16) {
@@ -275,7 +283,21 @@ uint64_t Table::bloom_rejections() const {
   return stats_->bloom_rejections.load(std::memory_order_relaxed);
 }
 
-Status Table::ReadBlock(const IndexEntry& entry, std::string* contents) const {
+uint64_t Table::block_cache_hits() const {
+  return stats_->cache_hits.load(std::memory_order_relaxed);
+}
+
+Status Table::ReadBlock(const IndexEntry& entry, BlockCache::Handle* out,
+                        bool cacheable) const {
+  const bool use_cache = cacheable && cache_ != nullptr;
+  if (use_cache) {
+    if (BlockCache::Handle cached = cache_->Lookup(file_number_, entry.offset)) {
+      stats_->cache_hits.fetch_add(1, std::memory_order_relaxed);
+      *out = std::move(cached);
+      return Status::OK();
+    }
+  }
+
   std::string buf;
   const Status s =
       ReadFullyAt(fd_, entry.offset, entry.size + kBlockTrailerSize, &buf);
@@ -286,8 +308,13 @@ Status Table::ReadBlock(const IndexEntry& entry, std::string* contents) const {
     return Status::Corruption(path_ + ": block checksum mismatch");
   }
   buf.resize(entry.size);
-  *contents = std::move(buf);
   stats_->blocks_read.fetch_add(1, std::memory_order_relaxed);
+
+  if (use_cache) {
+    *out = cache_->Insert(file_number_, entry.offset, std::move(buf));
+  } else {
+    *out = std::make_shared<const std::string>(std::move(buf));
+  }
   return Status::OK();
 }
 
@@ -315,14 +342,14 @@ bool Table::Get(std::string_view key, SequenceNumber seq, std::string* value,
   }
   if (lo >= index_.size()) return false;  // Past the end of the table.
 
-  std::string contents;
+  BlockCache::Handle contents;
   const Status s = ReadBlock(index_[lo], &contents);
   if (!s.ok()) {
     *status = s;
     return true;  // Surface the I/O error rather than silently reading past it.
   }
 
-  std::string_view rest(contents);
+  std::string_view rest(*contents);
   while (!rest.empty()) {
     std::string_view ikey, val;
     if (!GetLengthPrefixed(&rest, &ikey) || !GetLengthPrefixed(&rest, &val)) {
@@ -395,7 +422,7 @@ class TableIterator : public Iterator {
         valid_ = false;
         return false;
       }
-      rest_ = std::string_view(block_);
+      rest_ = std::string_view(*block_);
       if (!rest_.empty()) {
         ParseCurrent();
         return valid_;
@@ -420,7 +447,9 @@ class TableIterator : public Iterator {
 
   const Table* table_;
   size_t block_index_ = 0;
-  std::string block_;         // Owns the bytes key_/value_ point into.
+  // Keeps the bytes key_/value_ point into alive, even if the cache evicts the
+  // block while this cursor is still walking it.
+  BlockCache::Handle block_;
   std::string_view rest_;     // Unparsed remainder of block_.
   std::string_view key_;
   std::string_view value_;

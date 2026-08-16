@@ -32,6 +32,7 @@ endif()
 add_library(lsm
   src/arena.cpp
   src/bloom.cpp
+  src/cache.cpp
   src/crc32c.cpp
   src/db.cpp
   src/iterator.cpp
@@ -86,6 +87,7 @@ if(LSM_BUILD_TESTS)
   add_executable(lsm_tests
     tests/test_arena.cpp
     tests/test_bloom.cpp
+    tests/test_cache.cpp
     tests/test_crc32c.cpp
     tests/test_skiplist.cpp
     tests/test_memtable.cpp

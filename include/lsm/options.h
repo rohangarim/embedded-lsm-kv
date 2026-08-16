@@ -32,6 +32,10 @@ struct Options {
   // Bits of Bloom filter per key. 10 bits/key gives ~1% false positives.
   int bloom_bits_per_key = 10;
 
+  // Capacity of the shared cache of decoded data blocks. Zero disables it, in
+  // which case every block a read touches is pread and re-parsed from scratch.
+  size_t block_cache_bytes = 8u << 20;  // 8 MiB
+
   // L0 holds files with overlapping key ranges, so a point lookup may touch
   // every one of them. Compact once L0 reaches this many files.
   int l0_compaction_trigger = 4;

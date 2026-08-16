@@ -44,6 +44,7 @@ struct Config {
   std::string sync_policy = "never";
   std::string workloads = "load,A,B,C,D,E,F";
   std::string engine = "lsmtree";
+  size_t block_cache_bytes = 8u << 20;
   bool keep_db = false;
   double zipf_theta = 0.99;
 };
@@ -369,6 +370,7 @@ int main(int argc, char** argv) {
     else if (arg == "--sync" && i + 1 < argc) config.sync_policy = next();
     else if (arg == "--workloads" && i + 1 < argc) config.workloads = next();
     else if (arg == "--engine" && i + 1 < argc) config.engine = next();
+    else if (arg == "--block-cache-mb" && i + 1 < argc) config.block_cache_bytes = std::strtoull(next().c_str(), nullptr, 10) << 20;
     else if (arg == "--keep") config.keep_db = true;
     else {
       std::fprintf(stderr,
@@ -389,6 +391,7 @@ int main(int argc, char** argv) {
   engine_config.memtable_size_bytes = 4u << 20;
   engine_config.block_size_bytes = 4096;
   engine_config.bloom_bits_per_key = 10;
+  engine_config.block_cache_bytes = config.block_cache_bytes;
   engine_config.sync_every_write = config.sync_policy == "every";
 
   std::unique_ptr<bench::Engine> db;
@@ -419,6 +422,7 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(config.num_keys),
               static_cast<unsigned long long>(config.num_ops), config.value_size,
               config.threads, config.sync_policy.c_str());
+  std::printf("  block_cache=%zu MiB\n", config.block_cache_bytes >> 20);
 
   PrintHeader();
   for (const std::string& name : Split(config.workloads, ',')) {

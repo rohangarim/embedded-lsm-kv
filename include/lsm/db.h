@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "lsm/cache.h"
 #include "lsm/internal_key.h"
 #include "lsm/iterator.h"
 #include "lsm/memtable.h"
@@ -65,6 +66,14 @@ struct DbStats {
   uint64_t sstable_blocks_read = 0;
   uint64_t bloom_rejections = 0;
   uint64_t tables_probed = 0;
+  uint64_t block_cache_hits = 0;
+  uint64_t block_cache_misses = 0;
+  uint64_t block_cache_evictions = 0;
+  size_t block_cache_bytes_used = 0;
+
+  // Fraction of data-block reads served from memory rather than the
+  // filesystem.
+  double BlockCacheHitRate() const;
 
   // Bytes the engine wrote to disk per byte the user handed it. The cost of
   // turning random writes into sequential ones.
@@ -146,6 +155,10 @@ class DB {
   std::shared_ptr<MemTable> mem_;
   std::shared_ptr<MemTable> imm_;  // Being flushed; still visible to readers.
   std::shared_ptr<const Version> current_;
+
+  // Shared by every open table. Held by shared_ptr because a Table outlives the
+  // DB whenever a reader is still holding the version that references it.
+  std::shared_ptr<BlockCache> block_cache_;
 
   // Where the next compaction of each level should start, so successive
   // compactions sweep across the key space instead of rewriting the leftmost

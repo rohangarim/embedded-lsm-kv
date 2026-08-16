@@ -96,6 +96,12 @@ size_t Version::NumFiles() const {
   return n;
 }
 
+double DbStats::BlockCacheHitRate() const {
+  const uint64_t total = block_cache_hits + block_cache_misses;
+  return total == 0 ? 0.0 : static_cast<double>(block_cache_hits) /
+                                static_cast<double>(total);
+}
+
 double DbStats::WriteAmplification() const {
   if (user_bytes_written == 0) return 0.0;
   const double denom = static_cast<double>(user_bytes_written);
@@ -109,7 +115,11 @@ double DbStats::WriteAmplification() const {
 DB::DB(const Options& options, std::string path)
     : options_(options),
       path_(std::move(path)),
-      last_sync_time_(std::chrono::steady_clock::now()) {}
+      last_sync_time_(std::chrono::steady_clock::now()) {
+  if (options_.block_cache_bytes > 0) {
+    block_cache_ = std::make_shared<BlockCache>(options_.block_cache_bytes);
+  }
+}
 
 DB::~DB() {
   {
@@ -286,7 +296,8 @@ Status DB::LoadManifest(uint64_t* log_number) {
     if (level >= kNumLevels) return Status::Corruption("manifest level out of range");
 
     std::unique_ptr<Table> table;
-    const Status s = Table::Open(TablePath(meta->number), options_, &table);
+    const Status s = Table::Open(TablePath(meta->number), options_, &table,
+                                 block_cache_, meta->number);
     if (!s.ok()) return s;
     meta->table = std::shared_ptr<Table>(table.release());
     version->levels[level].push_back(std::move(meta));
@@ -585,7 +596,9 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
     }
   }
   std::unique_ptr<Table> table;
-  if (s.ok()) s = Table::Open(table_path, options_, &table);
+  if (s.ok()) {
+    s = Table::Open(table_path, options_, &table, block_cache_, number);
+  }
   lock.lock();
 
   if (!s.ok()) {
@@ -717,7 +730,8 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
     current_meta->smallest = builder->SmallestKey();
     current_meta->largest = builder->LargestKey();
     std::unique_ptr<Table> table;
-    fs = Table::Open(TablePath(current_meta->number), options_, &table);
+    fs = Table::Open(TablePath(current_meta->number), options_, &table,
+                     block_cache_, current_meta->number);
     if (!fs.ok()) return fs;
     current_meta->table = std::shared_ptr<Table>(table.release());
     output_bytes += current_meta->file_size;
@@ -774,6 +788,12 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
   std::set<uint64_t> removed;
   for (const auto& f : inputs0) removed.insert(f->number);
   for (const auto& f : inputs1) removed.insert(f->number);
+
+  // The inputs are about to stop being reachable; their blocks should not go on
+  // holding cache capacity that the outputs now need.
+  if (block_cache_ != nullptr) {
+    for (const uint64_t number : removed) block_cache_->EraseFile(number);
+  }
 
   auto version = std::make_shared<Version>(*current_);
   for (int l : {level, level + 1}) {
@@ -941,6 +961,12 @@ DbStats DB::GetStats() const {
       snapshot.sstable_blocks_read += f->table->blocks_read();
       snapshot.bloom_rejections += f->table->bloom_rejections();
     }
+  }
+  if (block_cache_ != nullptr) {
+    snapshot.block_cache_hits = block_cache_->hits();
+    snapshot.block_cache_misses = block_cache_->misses();
+    snapshot.block_cache_evictions = block_cache_->evictions();
+    snapshot.block_cache_bytes_used = block_cache_->charge_bytes();
   }
   return snapshot;
 }

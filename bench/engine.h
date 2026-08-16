@@ -11,6 +11,7 @@
 #include "lsm/db.h"
 
 #ifdef LSM_BENCH_LEVELDB
+#include <leveldb/cache.h>
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/options.h>
@@ -24,6 +25,7 @@ struct EngineConfig {
   size_t memtable_size_bytes = 4u << 20;
   size_t block_size_bytes = 4096;
   int bloom_bits_per_key = 10;
+  size_t block_cache_bytes = 8u << 20;
   bool sync_every_write = false;
 };
 
@@ -51,6 +53,7 @@ class LsmEngine : public Engine {
     options.memtable_size_bytes = config.memtable_size_bytes;
     options.block_size_bytes = config.block_size_bytes;
     options.bloom_bits_per_key = config.bloom_bits_per_key;
+    options.block_cache_bytes = config.block_cache_bytes;
     options.max_bytes_for_level_base = 16u << 20;
     options.target_file_size = 4u << 20;
     options.l0_compaction_trigger = 4;
@@ -104,6 +107,9 @@ class LsmEngine : public Engine {
         "  sstable blocks read    %llu\n"
         "  bloom rejections       %llu\n"
         "  tables probed          %llu\n"
+        "  block cache hit rate   %.1f%% (%llu hits / %llu misses)\n"
+        "  block cache evictions  %llu\n"
+        "  block cache resident   %.1f MiB\n"
         "\nlevel shape\n%s",
         (unsigned long long)stats.writes, (unsigned long long)stats.wal_syncs,
         (unsigned long long)stats.memtable_flushes,
@@ -113,6 +119,11 @@ class LsmEngine : public Engine {
         (unsigned long long)stats.sstable_blocks_read,
         (unsigned long long)stats.bloom_rejections,
         (unsigned long long)stats.tables_probed,
+        stats.BlockCacheHitRate() * 100.0,
+        (unsigned long long)stats.block_cache_hits,
+        (unsigned long long)stats.block_cache_misses,
+        (unsigned long long)stats.block_cache_evictions,
+        stats.block_cache_bytes_used / 1048576.0,
         db_->DebugLevelSummary().c_str());
     return buf;
   }
@@ -141,17 +152,22 @@ class LevelDbEngine : public Engine {
     options.compression = leveldb::kNoCompression;  // We do not compress either.
     options.filter_policy =
         leveldb::NewBloomFilterPolicy(config.bloom_bits_per_key);
+    // Match our block cache budget rather than leaving LevelDB on its 8 MiB
+    // default, so neither engine is handed an advantage here.
+    options.block_cache = leveldb::NewLRUCache(config.block_cache_bytes);
 
     leveldb::DB* raw = nullptr;
     const leveldb::Status s = leveldb::DB::Open(options, config.path, &raw);
     if (!s.ok()) {
       *error = s.ToString();
       delete options.filter_policy;
+      delete options.block_cache;
       return nullptr;
     }
     auto engine = std::unique_ptr<LevelDbEngine>(new LevelDbEngine());
     engine->db_.reset(raw);
     engine->filter_policy_ = options.filter_policy;
+    engine->block_cache_ = options.block_cache;
     engine->write_options_.sync = config.sync_every_write;
     return engine;
   }
@@ -159,6 +175,7 @@ class LevelDbEngine : public Engine {
   ~LevelDbEngine() override {
     db_.reset();
     delete filter_policy_;
+    delete block_cache_;
   }
 
   bool Put(std::string_view key, std::string_view value) override {
@@ -198,6 +215,7 @@ class LevelDbEngine : public Engine {
 
   std::unique_ptr<leveldb::DB> db_;
   const leveldb::FilterPolicy* filter_policy_ = nullptr;
+  leveldb::Cache* block_cache_ = nullptr;
   leveldb::WriteOptions write_options_;
   leveldb::ReadOptions read_options_;
 };

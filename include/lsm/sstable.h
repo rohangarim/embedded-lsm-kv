@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "lsm/bloom.h"
+#include "lsm/cache.h"
 #include "lsm/internal_key.h"
 #include "lsm/iterator.h"
 #include "lsm/options.h"
@@ -92,8 +93,13 @@ class TableBuilder {
 // once at open; data blocks are read on demand.
 class Table {
  public:
+  // `cache` and `file_number` may be omitted; without a cache every block read
+  // goes to the filesystem. The file number is the cache's namespace, so two
+  // tables sharing a cache must never share one.
   static Status Open(const std::string& path, const Options& options,
-                     std::unique_ptr<Table>* table);
+                     std::unique_ptr<Table>* table,
+                     std::shared_ptr<BlockCache> cache = nullptr,
+                     uint64_t file_number = 0);
 
   ~Table();
 
@@ -114,9 +120,12 @@ class Table {
   size_t num_data_blocks() const { return index_.size(); }
   const BloomFilter& bloom() const { return bloom_; }
 
-  // Counters for the benchmark's read-amplification story.
+  // Counters for the benchmark's read-amplification story. blocks_read counts
+  // blocks actually fetched from the filesystem, so cache hits do not inflate
+  // it.
   uint64_t blocks_read() const;
   uint64_t bloom_rejections() const;
+  uint64_t block_cache_hits() const;
 
  private:
   friend class TableIterator;
@@ -129,12 +138,19 @@ class Table {
 
   Table() = default;
 
-  Status ReadBlock(const IndexEntry& entry, std::string* contents) const;
+  // Returns a handle rather than a copy so a cached block is shared, not
+  // duplicated, and stays alive for as long as the caller holds the handle.
+  // `cacheable` is false for the index and bloom blocks, which are read once at
+  // open and retained for the life of the table anyway.
+  Status ReadBlock(const IndexEntry& entry, BlockCache::Handle* out,
+                   bool cacheable = true) const;
 
   std::string path_;
   int fd_ = -1;
   uint64_t file_size_ = 0;
   bool verify_checksums_ = true;
+  std::shared_ptr<BlockCache> cache_;
+  uint64_t file_number_ = 0;
   std::vector<IndexEntry> index_;
   BloomFilter bloom_;
 
