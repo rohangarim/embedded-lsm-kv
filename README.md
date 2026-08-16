@@ -161,7 +161,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 92 tests
+ctest --test-dir build --output-on-failure   # 93 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -222,83 +222,96 @@ cmake --build build
 ./build/lsm_bench --engine leveldb --keys 500000 --ops 500000
 ```
 
+Both engines run back-to-back on an otherwise idle machine, with matched 4 MiB
+write buffers, 4 KiB blocks, 10-bits-per-key Bloom filters and 8 MiB block
+caches. Checksum verification is **on** for lsmtree; LevelDB's default
+(`verify_checksums = false`) is left alone, so this is the harder configuration
+for us.
+
 Throughput, operations per second:
 
 | Workload | Mix | lsmtree | LevelDB | Ratio |
 |---|---|---:|---:|---:|
-| load | 100% insert | 328 954 | 502 996 | 0.65x |
-| A | 50% read / 50% update | 233 817 | 280 481 | 0.83x |
-| B | 95% read / 5% update | 273 890 | 719 733 | 0.38x |
-| C | 100% read | 266 032 | 1 337 607 | 0.20x |
-| D | 95% read latest / 5% insert | 377 117 | 1 277 812 | 0.30x |
-| E | 95% scan (50 rows) / 5% insert | 12 271 | 242 951 | 0.05x |
-| F | 50% read / 50% read-modify-write | 176 693 | 251 451 | 0.70x |
+| load | 100% insert | 381 895 | 489 438 | 0.78x |
+| A | 50% read / 50% update | **437 989** | 280 197 | **1.56x** |
+| B | 95% read / 5% update | **764 816** | 704 109 | **1.09x** |
+| C | 100% read | 996 459 | 1 293 279 | 0.77x |
+| D | 95% read latest / 5% insert | 1 136 292 | 1 263 159 | 0.90x |
+| E | 95% scan (50 rows) / 5% insert | 19 030 | 243 579 | 0.08x |
+| F | 50% read / 50% read-modify-write | **348 869** | 238 502 | **1.46x** |
 
 Latency, microseconds (lsmtree):
 
 | Workload | p50 | p95 | p99 | p99.9 |
 |---|---:|---:|---:|---:|
-| load | 1.67 | 3.00 | 4.67 | 16.54 |
-| A | 1.79 | 12.29 | 16.04 | 60.75 |
-| B | 0.58 | 11.33 | 13.42 | 25.83 |
-| C | 0.54 | 11.04 | 13.42 | 21.54 |
-| D | 0.33 | 10.83 | 12.46 | 20.08 |
-| E | 57.54 | 221.29 | 267.42 | 891.04 |
-| F | 2.17 | 13.62 | 15.54 | 26.29 |
+| load | 1.38 | 2.75 | 4.58 | 12.54 |
+| A | 1.50 | 3.29 | 4.62 | 13.75 |
+| B | 0.50 | 2.92 | 3.62 | 8.25 |
+| C | 0.46 | 2.58 | 3.08 | 4.67 |
+| D | 0.33 | 2.58 | 3.21 | 4.67 |
+| E | 17.00 | 219.79 | 238.29 | 309.29 |
+| F | 1.96 | 5.08 | 6.75 | 14.29 |
 
-Engine counters for the lsmtree run: 40 memtable flushes, 28 compactions,
-509 MiB read into compaction against 444 MiB written out, **5.95x write
-amplification**, and a **93.8% block cache hit rate** (33.4M hits, 2.2M misses)
-over the 1 074 802 writes issued.
+### How it got here
 
-### What the block cache bought
+Three changes, each measured, on the read path. Same hardware and workloads
+throughout:
 
-Adding the cache is the single largest change measured so far. Same hardware,
-same workloads, same level shapes:
+| Workload | Baseline | + block cache | + fast CRC-32C | LevelDB |
+|---|---:|---:|---:|---:|
+| A | 245 559 | 233 817 | **437 989** | 280 197 |
+| B | 209 565 | 273 890 | **764 816** | 704 109 |
+| C | 193 454 | 266 032 | **996 459** | 1 293 279 |
+| D | 293 905 | 377 117 | **1 136 292** | 1 263 159 |
+| E | 1 489 | 12 271 | **19 030** | 243 579 |
+| F | 156 129 | 176 693 | **348 869** | 238 502 |
 
-| Workload | Before | After | Change |
-|---|---:|---:|---:|
-| B (95% read) | 209 565 | 273 890 | +31% |
-| C (100% read) | 193 454 | 266 032 | +38% |
-| D (read latest) | 293 905 | 377 117 | +28% |
-| F (read-modify-write) | 156 129 | 176 693 | +13% |
-| **E (scan)** | **1 489** | **12 271** | **+724%** |
+**The merging iterator** was the first fix, before the table above. `NewIterator`
+gave the merge one cursor per *file*, so every `Seek` read a block out of every
+file in every level. One concatenating cursor per level below L0 took scans from
+1 141 to ~20 000 ops/sec on a freshly-loaded database.
 
-Blocks actually fetched from the filesystem across the whole run fell from
-986 249 to 201 758. Scans gain the most because they were paying the worst
-price: stepping over the shadowed versions of a Zipfian-hot key could touch a
-hundred blocks for one logical row, and every one of those was a fresh `pread`
-plus a re-parse.
+**The block cache** cut blocks fetched from the filesystem across a full run from
+986 249 to 201 758, at a 93.8% hit rate. Scans gained most (+724%) because they
+were paying worst: stepping over the shadowed versions of a Zipfian-hot key could
+touch a hundred blocks for one logical row.
 
-Workload A is flat to slightly down, which is the honest result — it is half
-writes, and the cache adds a hashed, mutex-guarded lookup to a path that was
-already mostly hitting the memtable.
+**CRC-32C** turned out to be the whole remaining read gap, which was not obvious
+until it was measured. Point-read p95 sat at a suspiciously flat ~11 µs across
+every read-heavy workload regardless of what else changed — not a cache-miss
+profile, and unaffected by removing a malloc per lookup or two mutex acquisitions
+per `Get`. Running with verification disabled took workload C from 264 k to
+1 295 k ops/sec, which identified it: a byte-at-a-time table CRC over every
+4 KiB block, roughly a nanosecond per byte, was ~9 µs of that p95. LevelDB does
+not verify block checksums by default, so it never paid this at all.
 
-### Why it is still slower
+The fix was to make verification cheap rather than to turn it off. `Extend` now
+uses the CPU's CRC32C instruction (ARMv8 CRC or SSE4.2) with slicing-by-8 tables
+as the portable fallback, and a test asserts the two paths agree bit-for-bit
+across a range of lengths — a mismatch between builds would make already-written
+files unreadable.
 
-**Writes (0.65x on load).** Mostly per-record framing. This engine writes a
-fixed 4-byte length prefix where LevelDB uses varints and prefix-compresses keys
-within a block, so identical data occupies more bytes in both the WAL and the
-SSTable. LevelDB also groups concurrent writers into one log append; here every
-writer takes the mutex on its own.
+Two smaller changes are in the same range: point lookups now build their
+internal key in a stack buffer rather than a `std::string` (one fewer malloc per
+read), and the read-path counters are atomics, so a `Get` takes the DB mutex once
+instead of three times. Each was worth a few percent on its own — worth keeping,
+but neither was the bottleneck, and the measurements say so.
 
-**Point reads (0.20–0.38x).** No longer a cache-miss problem — the hit rate is
-93.8%. What remains is per-lookup constant factor, and there are three known
-contributors, in rough order of expected size:
+### Why scans are still 0.08x
 
-1. `Table::Get` builds its lookup key with a heap-allocating `std::string`, so
-   every point read costs a malloc. LevelDB assembles short keys in a stack
-   buffer.
-2. Data blocks have no restart points, so finding a key inside a block is a
-   linear walk that re-decodes every length prefix from the start of the block.
-   LevelDB binary-searches to the nearest restart point first.
-3. The cache lookup itself takes a per-shard mutex on the hot path.
+Workload E is the one remaining large gap, and the cause is understood rather
+than mysterious. `MergingIterator::FindSmallest` is a linear scan over its
+children: with L0 files plus one cursor per deeper level, every `Next()` costs
+~20 comparisons. That is fine for compaction, which merges a handful of files,
+but a range scan after heavy update churn has to step over every shadowed
+version of each hot key to reach the next live one — so the linear scan is paid
+hundreds of times per logical row. A binary heap makes each step O(log n)
+instead, and that is the next thing to build.
 
-**Scans (0.05x).** Same three causes, amplified by how many entries a scan
-touches. The per-file-cursor problem that used to dominate here is fixed — the
-merge now takes one concatenating cursor per level below L0 rather than one per
-file — and the cache removed the I/O. What is left is the constant factor above,
-paid once per entry stepped over rather than once per operation.
+The measurement that isolates it: E runs at ~228 000 ops/sec when the workload
+sequence is `load, C, E`, and ~19 000 in the full `load, A, B, C, D, F, E`
+sequence, at identical level shapes. The difference is entirely how many
+shadowed versions the scan has to walk.
 
 ### Bloom filter false-positive rates
 
@@ -319,13 +332,15 @@ in the single-table test — the filter rejects it outright.
 
 These are deliberate, not oversights:
 
-- **A malloc per point lookup.** `Table::Get` builds its lookup key into a
-  `std::string`. This is the most obviously fixable item on the list and is
-  next.
+- **The merging iterator is a linear scan over its children**, not a heap. This
+  is the largest remaining gap (scans, above) and is next.
 - **No restart points or prefix compression in data blocks.** Keys are stored
   whole and located by a linear walk from the start of the block. LevelDB's
   restart intervals give both a binary search within the block and a smaller
   file.
+- **`ReadOptions::verify_checksums` is ignored.** Verification is controlled by
+  the database-wide `Options` only. Now that verification is cheap this matters
+  much less, but the per-read option should either work or not exist.
 - **No compression.** Both engines are benchmarked with compression off so the
   comparison is about structure rather than about zlib.
 - **Whole-DB write lock.** One mutex serializes writers. Real engines batch

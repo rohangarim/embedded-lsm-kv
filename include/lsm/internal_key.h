@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 
@@ -92,5 +93,45 @@ struct InternalKeyLess {
 inline std::string LookupKey(std::string_view user_key, SequenceNumber seq) {
   return EncodeInternalKey(user_key, seq, ValueType::kValue);
 }
+
+// Stack-backed builder for the same thing.
+//
+// Every point lookup needs a throwaway internal key, and going through
+// std::string meant a malloc and free on the hottest path in the engine. Keys
+// up to kInlineCapacity are assembled in place; anything longer falls back to
+// the heap, so correctness never depends on the bound being generous enough.
+class LookupKeyBuffer {
+ public:
+  static constexpr size_t kInlineCapacity = 200;
+
+  LookupKeyBuffer(std::string_view user_key, SequenceNumber seq,
+                  ValueType type = ValueType::kValue) {
+    const size_t total = user_key.size() + kTagSize;
+    char* out;
+    if (total <= kInlineCapacity) {
+      out = inline_buf_;
+    } else {
+      heap_.resize(total);
+      out = heap_.data();
+    }
+    if (!user_key.empty()) {
+      std::memcpy(out, user_key.data(), user_key.size());
+    }
+    const uint64_t tag = PackTag(seq, type);
+    std::memcpy(out + user_key.size(), &tag, sizeof(tag));
+    key_ = std::string_view(out, total);
+  }
+
+  LookupKeyBuffer(const LookupKeyBuffer&) = delete;
+  LookupKeyBuffer& operator=(const LookupKeyBuffer&) = delete;
+
+  std::string_view key() const { return key_; }
+  operator std::string_view() const { return key_; }
+
+ private:
+  char inline_buf_[kInlineCapacity];
+  std::string heap_;
+  std::string_view key_;
+};
 
 }  // namespace lsm

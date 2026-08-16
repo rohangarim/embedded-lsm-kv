@@ -186,6 +186,14 @@ class DB {
   Status bg_error_;
 
   mutable DbStats stats_;
+
+  // Hot-path counters, kept out of stats_ deliberately. A Get used to take mu_
+  // three times -- once to snapshot the memtables and version, and twice more
+  // purely to count -- on the same mutex a background compaction holds while it
+  // commits a manifest. Counting is not worth contending for.
+  mutable std::atomic<uint64_t> stat_gets_{0};
+  mutable std::atomic<uint64_t> stat_get_hits_memtable_{0};
+  mutable std::atomic<uint64_t> stat_tables_probed_{0};
 };
 
 }  // namespace lsm

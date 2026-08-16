@@ -327,7 +327,8 @@ bool Table::Get(std::string_view key, SequenceNumber seq, std::string* value,
     return false;
   }
 
-  const std::string target = LookupKey(key, seq);
+  const LookupKeyBuffer lookup(key, seq);
+  const std::string_view target = lookup.key();
 
   // First block whose largest key is >= target. Sparse index: this is the only
   // block that can hold the key.

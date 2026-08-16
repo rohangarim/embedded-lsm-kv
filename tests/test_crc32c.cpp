@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <random>
 #include <string>
 
 namespace lsm {
@@ -31,6 +33,23 @@ TEST(Crc32c, DetectsSingleBitFlip) {
       flipped[i] = static_cast<char>(flipped[i] ^ (1 << bit));
       EXPECT_NE(crc32c::Value(flipped), original) << "byte " << i << " bit " << bit;
     }
+  }
+}
+
+// The hardware instruction and the portable tables must agree exactly. If they
+// ever diverge, a file written on one machine stops verifying on another.
+TEST(Crc32c, HardwarePathMatchesPortablePath) {
+  std::printf("[crc32c] hardware acceleration: %s\n",
+              crc32c::UsingHardwareAcceleration() ? "yes" : "no");
+
+  std::mt19937 rng(20260816);
+  for (size_t length : {0u, 1u, 2u, 3u, 7u, 8u, 9u, 15u, 16u, 31u, 64u, 100u,
+                        1000u, 4096u, 4097u, 65536u}) {
+    std::string data(length, '\0');
+    for (size_t i = 0; i < length; ++i) data[i] = static_cast<char>(rng());
+    EXPECT_EQ(crc32c::Value(data.data(), data.size()),
+              crc32c::ExtendPortable(0, data.data(), data.size()))
+        << "length " << length;
   }
 }
 

@@ -45,6 +45,7 @@ struct Config {
   std::string workloads = "load,A,B,C,D,E,F";
   std::string engine = "lsmtree";
   size_t block_cache_bytes = 8u << 20;
+  bool verify_checksums = true;
   bool keep_db = false;
   double zipf_theta = 0.99;
 };
@@ -371,6 +372,7 @@ int main(int argc, char** argv) {
     else if (arg == "--workloads" && i + 1 < argc) config.workloads = next();
     else if (arg == "--engine" && i + 1 < argc) config.engine = next();
     else if (arg == "--block-cache-mb" && i + 1 < argc) config.block_cache_bytes = std::strtoull(next().c_str(), nullptr, 10) << 20;
+    else if (arg == "--no-verify-checksums") config.verify_checksums = false;
     else if (arg == "--keep") config.keep_db = true;
     else {
       std::fprintf(stderr,
@@ -392,6 +394,7 @@ int main(int argc, char** argv) {
   engine_config.block_size_bytes = 4096;
   engine_config.bloom_bits_per_key = 10;
   engine_config.block_cache_bytes = config.block_cache_bytes;
+  engine_config.verify_checksums = config.verify_checksums;
   engine_config.sync_every_write = config.sync_policy == "every";
 
   std::unique_ptr<bench::Engine> db;

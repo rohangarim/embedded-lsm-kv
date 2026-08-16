@@ -27,6 +27,7 @@ struct EngineConfig {
   int bloom_bits_per_key = 10;
   size_t block_cache_bytes = 8u << 20;
   bool sync_every_write = false;
+  bool verify_checksums = true;
 };
 
 class Engine {
@@ -58,6 +59,7 @@ class LsmEngine : public Engine {
     options.target_file_size = 4u << 20;
     options.l0_compaction_trigger = 4;
     options.sync_policy = policy;
+    options.verify_checksums = config.verify_checksums;
     options.background_compaction = true;
 
     std::unique_ptr<lsm::DB> db;

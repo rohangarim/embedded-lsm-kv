@@ -6,10 +6,12 @@ MemTable::MemTable() : table_(internal::EntryComparator(), &arena_) {}
 
 void MemTable::Add(SequenceNumber seq, ValueType type, std::string_view key,
                    std::string_view value) {
+  // Built directly into the entry buffer: going through a temporary
+  // std::string for the internal key cost an extra allocation on every write.
+  const LookupKeyBuffer internal_key(key, seq, type);
   std::string entry;
   entry.reserve(key.size() + value.size() + kTagSize + 8);
-  const std::string internal_key = EncodeInternalKey(key, seq, type);
-  PutLengthPrefixed(&entry, internal_key);
+  PutLengthPrefixed(&entry, internal_key.key());
   PutLengthPrefixed(&entry, value);
   table_.Insert(entry);
 }
@@ -26,7 +28,8 @@ void MemTable::Iterator::Seek(std::string_view target) {
 bool MemTable::Get(std::string_view key, SequenceNumber seq, std::string* value,
                    Status* status) const {
   Iterator iter(this);
-  iter.Seek(LookupKey(key, seq));
+  const LookupKeyBuffer lookup(key, seq);
+  iter.Seek(lookup.key());
   if (!iter.Valid()) return false;
 
   // Seek landed on the first entry >= (key, seq). Because equal user keys sort

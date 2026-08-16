@@ -503,8 +503,8 @@ Status DB::Get(const ReadOptions& opts, std::string_view key, std::string* value
     imm = imm_;
     version = current_;
     seq = last_sequence_;
-    ++stats_.gets;
   }
+  stat_gets_.fetch_add(1, std::memory_order_relaxed);
   (void)opts;
 
   // Newest source first: active memtable, the one being flushed, then L0
@@ -513,8 +513,7 @@ Status DB::Get(const ReadOptions& opts, std::string_view key, std::string* value
   // tombstone.
   Status s;
   if (mem->Get(key, seq, value, &s)) {
-    std::lock_guard<std::mutex> guard(mu_);
-    ++stats_.get_hits_memtable;
+    stat_get_hits_memtable_.fetch_add(1, std::memory_order_relaxed);
     return s;
   }
   if (imm != nullptr && imm->Get(key, seq, value, &s)) return s;
@@ -551,10 +550,7 @@ Status DB::Get(const ReadOptions& opts, std::string_view key, std::string* value
     }
   }
 
-  {
-    std::lock_guard<std::mutex> guard(mu_);
-    stats_.tables_probed += probed;
-  }
+  stat_tables_probed_.fetch_add(probed, std::memory_order_relaxed);
 
   if (!found) return Status::NotFound();
   return s;
@@ -956,6 +952,10 @@ void DB::SetWalWriteHook(WalWriter::WriteHook hook) {
 DbStats DB::GetStats() const {
   std::lock_guard<std::mutex> guard(mu_);
   DbStats snapshot = stats_;
+  snapshot.gets = stat_gets_.load(std::memory_order_relaxed);
+  snapshot.get_hits_memtable =
+      stat_get_hits_memtable_.load(std::memory_order_relaxed);
+  snapshot.tables_probed = stat_tables_probed_.load(std::memory_order_relaxed);
   for (const auto& level : current_->levels) {
     for (const auto& f : level) {
       snapshot.sstable_blocks_read += f->table->blocks_read();
@@ -1099,7 +1099,8 @@ class DBIter : public Iterator {
   }
 
   void Seek(std::string_view target) override {
-    inner_->Seek(LookupKey(target, seq_));
+    const LookupKeyBuffer lookup(target, seq_);
+    inner_->Seek(lookup.key());
     AdvanceToNextLiveKey();
   }
 
