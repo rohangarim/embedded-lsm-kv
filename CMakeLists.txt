@@ -40,6 +40,7 @@ add_library(lsm
   src/memtable.cpp
   src/sstable.cpp
   src/wal.cpp
+  src/write_batch.cpp
 )
 target_include_directories(lsm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(lsm PRIVATE -Wall -Wextra -Wpedantic)
@@ -95,6 +96,7 @@ if(LSM_BUILD_TESTS)
     tests/test_iterator.cpp
     tests/test_memtable.cpp
     tests/test_wal.cpp
+    tests/test_write_batch.cpp
     tests/test_snapshot.cpp
     tests/test_sstable.cpp
     tests/test_db.cpp

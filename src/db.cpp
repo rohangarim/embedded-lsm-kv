@@ -431,34 +431,50 @@ SequenceNumber DB::SmallestSnapshot() const {
 
 // ---------------------------------------------------------------- write path
 
-Status DB::Write(const WriteOptions& opts, ValueType type, std::string_view key,
-                 std::string_view value) {
+Status DB::Write(const WriteOptions& opts, const WriteBatch& batch) {
+  if (batch.empty()) return Status::OK();
+
   std::unique_lock<std::mutex> lock(mu_);
   if (!bg_error_.ok()) return bg_error_;
 
   Status s = MakeRoomForWrite(lock);
   if (!s.ok()) return s;
 
-  const SequenceNumber seq = ++last_sequence_;
+  // The batch occupies a contiguous run of sequence numbers, so a later entry
+  // shadows an earlier one for the same key exactly as two separate writes
+  // would.
+  const SequenceNumber base = last_sequence_ + 1;
+  last_sequence_ += batch.Count();
 
   // WAL first, memtable second. If the order were reversed a crash could leave
   // a value readable in memory that was never logged -- and after recovery the
   // acknowledged write would simply be gone.
-  s = log_->AddRecord(seq, type, key, value);
+  //
+  // The whole batch goes into one log record under one CRC, which is what makes
+  // it atomic: a torn write leaves a fragment that replay discards entirely.
+  s = log_->AddRecord(base, batch);
   if (!s.ok()) return s;
   wal_dirty_ = true;
-  // Record overhead: 8-byte header (crc + length), 8-byte tag, two 4-byte
-  // length prefixes.
-  stats_.bytes_written_to_wal += key.size() + value.size() + 24;
-  stats_.user_bytes_written += key.size() + value.size();
 
   // A failed fsync must not be swallowed: the caller would take an OK as a
   // durability guarantee the device never gave us.
   s = MaybeSyncWal(opts);
   if (!s.ok()) return s;
 
-  mem_->Add(seq, type, key, value);
-  ++stats_.writes;
+  SequenceNumber seq = base;
+  uint64_t user_bytes = 0;
+  s = batch.ForEach(
+      [&](ValueType type, std::string_view key, std::string_view value) {
+        mem_->Add(seq++, type, key, value);
+        user_bytes += key.size() + value.size();
+      });
+  if (!s.ok()) return s;
+
+  // Record overhead: an 8-byte record header (crc + length), a 12-byte batch
+  // header, and per entry a type byte plus two varint lengths.
+  stats_.bytes_written_to_wal += user_bytes + 20 + batch.Count() * 5;
+  stats_.user_bytes_written += user_bytes;
+  stats_.writes += batch.Count();
   return Status::OK();
 }
 
@@ -499,11 +515,15 @@ Status DB::MaybeSyncWal(const WriteOptions& opts) {
 
 Status DB::Put(const WriteOptions& opts, std::string_view key,
                std::string_view value) {
-  return Write(opts, ValueType::kValue, key, value);
+  WriteBatch batch;
+  batch.Put(key, value);
+  return Write(opts, batch);
 }
 
 Status DB::Delete(const WriteOptions& opts, std::string_view key) {
-  return Write(opts, ValueType::kDeletion, key, std::string_view());
+  WriteBatch batch;
+  batch.Delete(key);
+  return Write(opts, batch);
 }
 
 Status DB::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {

@@ -9,11 +9,15 @@
 
 #include "lsm/coding.h"
 #include "lsm/crc32c.h"
+#include "lsm/write_batch.h"
 
 namespace lsm {
 namespace {
 
 constexpr size_t kHeaderSize = 8;  // crc32 + payload length
+constexpr size_t kFileHeaderSize = 8;
+constexpr char kFileMagic[7] = {'L', 'S', 'M', 'W', 'A', 'L', '\0'};
+constexpr char kFormatVersion = 2;
 
 Status PosixError(const std::string& what) {
   return Status::IOError(what + ": " + std::strerror(errno));
@@ -45,6 +49,14 @@ Status WalWriter::Open(const std::string& path) {
   if (fd < 0) return PosixError("open " + path);
   fd_ = fd;
   file_size_ = static_cast<uint64_t>(::lseek(fd_, 0, SEEK_END));
+
+  if (file_size_ == 0) {
+    std::string header(kFileMagic, sizeof(kFileMagic));
+    header.push_back(kFormatVersion);
+    const Status s = WriteFully(fd_, header.data(), header.size());
+    if (!s.ok()) return s;
+    file_size_ += header.size();
+  }
   return Status::OK();
 }
 
@@ -58,13 +70,24 @@ Status WalWriter::Close() {
 
 Status WalWriter::AddRecord(SequenceNumber seq, ValueType type,
                             std::string_view key, std::string_view value) {
+  WriteBatch batch;
+  if (type == ValueType::kDeletion) {
+    batch.Delete(key);
+  } else {
+    batch.Put(key, value);
+  }
+  return AddRecord(seq, batch);
+}
+
+Status WalWriter::AddRecord(SequenceNumber seq, const WriteBatch& batch) {
   if (fd_ < 0) return Status::InvalidArgument("WAL writer not open");
+  if (batch.empty()) return Status::OK();
 
   std::string payload;
-  payload.reserve(kTagSize + 8 + key.size() + value.size());
-  PutFixed64(&payload, PackTag(seq, type));
-  PutLengthPrefixed(&payload, key);
-  PutLengthPrefixed(&payload, value);
+  payload.reserve(12 + batch.ApproximateSize());
+  PutFixed64(&payload, seq);
+  PutFixed32(&payload, batch.Count());
+  payload.append(batch.entries());
 
   scratch_.clear();
   PutFixed32(&scratch_, crc32c::Value(payload.data(), payload.size()));
@@ -127,7 +150,21 @@ Status WalReader::Replay(const std::string& path, const Handler& handler,
   }
   ::close(fd);
 
-  size_t offset = 0;
+  if (buf.empty()) return Status::OK();  // Created but never written to.
+  if (buf.size() < kFileHeaderSize) {
+    // Killed between creating the log and finishing its header. Nothing was
+    // acknowledged out of it, so this is a truncated tail like any other.
+    if (saw_truncated_tail != nullptr) *saw_truncated_tail = true;
+    return Status::OK();
+  }
+  if (std::memcmp(buf.data(), kFileMagic, sizeof(kFileMagic)) != 0) {
+    return Status::Corruption(path + ": not a WAL file");
+  }
+  if (buf[sizeof(kFileMagic)] != kFormatVersion) {
+    return Status::Corruption(path + ": unsupported WAL format version");
+  }
+
+  size_t offset = kFileHeaderSize;
   while (offset < buf.size()) {
     if (buf.size() - offset < kHeaderSize) {
       if (saw_truncated_tail != nullptr) *saw_truncated_tail = true;
@@ -149,16 +186,20 @@ Status WalReader::Replay(const std::string& path, const Handler& handler,
       break;
     }
 
-    std::string_view rest(payload, length);
-    if (rest.size() < kTagSize) return Status::Corruption("WAL record too short");
-    const uint64_t tag = DecodeFixed64(rest.data());
-    rest.remove_prefix(kTagSize);
+    if (length < 12) return Status::Corruption("WAL record too short");
+    const SequenceNumber base = DecodeFixed64(payload);
+    const uint32_t count = DecodeFixed32(payload + 8);
 
-    std::string_view key, value;
-    if (!GetLengthPrefixed(&rest, &key) || !GetLengthPrefixed(&rest, &value)) {
-      return Status::Corruption("WAL record has malformed key/value framing");
-    }
-    handler(tag >> 8, static_cast<ValueType>(tag & 0xffu), key, value);
+    // The batch is all-or-nothing: it passed its CRC, so every entry in it was
+    // acknowledged and every entry gets replayed.
+    SequenceNumber seq = base;
+    const Status s = WriteBatch::Decode(std::string_view(payload + 12, length - 12),
+                                        count,
+                                        [&](ValueType type, std::string_view key,
+                                            std::string_view value) {
+                                          handler(seq++, type, key, value);
+                                        });
+    if (!s.ok()) return s;
 
     offset += kHeaderSize + length;
   }

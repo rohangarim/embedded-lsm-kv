@@ -20,6 +20,7 @@
 #include "lsm/sstable.h"
 #include "lsm/status.h"
 #include "lsm/wal.h"
+#include "lsm/write_batch.h"
 
 namespace lsm {
 
@@ -120,6 +121,10 @@ class DB {
   Status Put(const WriteOptions& opts, std::string_view key,
              std::string_view value);
   Status Delete(const WriteOptions& opts, std::string_view key);
+
+  // Applies every entry in `batch` atomically: after a crash, either all of it
+  // is there or none of it is. Put and Delete are batches of one.
+  Status Write(const WriteOptions& opts, const WriteBatch& batch);
   Status Get(const ReadOptions& opts, std::string_view key, std::string* value);
 
   // Forward scan over live user keys. Tombstoned and shadowed versions are
@@ -151,8 +156,6 @@ class DB {
   DB(const Options& options, std::string path);
 
   Status Recover();
-  Status Write(const WriteOptions& opts, ValueType type, std::string_view key,
-               std::string_view value);
 
   // Called with mu_ held; may release it while rotating the log.
   Status MakeRoomForWrite(std::unique_lock<std::mutex>& lock);

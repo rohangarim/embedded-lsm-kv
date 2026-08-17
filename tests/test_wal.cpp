@@ -191,6 +191,83 @@ TEST(Wal, WriteHookCanTruncateARecord) {
   EXPECT_EQ(std::get<3>(records[0]), "keep");
 }
 
+// A batch is one record under one CRC, so a torn write loses all of it or none
+// of it. Half a batch has no encoding.
+TEST(Wal, BatchesReplayAtomically) {
+  testing_support::ScopedTempDir dir("wal_batch");
+  const std::string path = dir.File("000001.log");
+  {
+    WalWriter writer;
+    ASSERT_TRUE(writer.Open(path).ok());
+    for (int b = 0; b < 20; ++b) {
+      WriteBatch batch;
+      for (int i = 0; i < 5; ++i) {
+        batch.Put(testing_support::Key(b * 5 + i), testing_support::Value(b * 5 + i));
+      }
+      ASSERT_TRUE(writer.AddRecord(static_cast<SequenceNumber>(b * 5 + 1), batch).ok());
+    }
+    ASSERT_TRUE(writer.Close().ok());
+  }
+
+  const auto records = ReplayAll(path);
+  ASSERT_EQ(records.size(), 100u);
+  for (size_t i = 0; i < records.size(); ++i) {
+    // Entries get consecutive sequence numbers across the whole batch.
+    EXPECT_EQ(std::get<0>(records[i]), i + 1);
+    EXPECT_EQ(std::get<2>(records[i]), testing_support::Key(static_cast<int>(i)));
+  }
+
+  // Truncating anywhere inside the last record must drop that entire batch,
+  // never a partial one.
+  for (const off_t cut : {1, 20, 60}) {
+    const std::string copy = path + ".cut";
+    ASSERT_EQ(std::system(("cp '" + path + "' '" + copy + "'").c_str()), 0);
+    TruncateFile(copy, cut);
+    const auto partial = ReplayAll(copy);
+    EXPECT_EQ(partial.size() % 5, 0u)
+        << "cut=" << cut << " left " << partial.size() << " entries";
+    EXPECT_EQ(partial.size(), 95u) << "cut=" << cut;
+    ::unlink(copy.c_str());
+  }
+}
+
+TEST(Wal, RejectsAFileThatIsNotALog) {
+  testing_support::ScopedTempDir dir("wal_foreign");
+  const std::string path = dir.File("000001.log");
+  {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    const std::string junk(64, 'Z');
+    ASSERT_EQ(::write(fd, junk.data(), junk.size()),
+              static_cast<ssize_t>(junk.size()));
+    ::close(fd);
+  }
+  const Status s = WalReader::Replay(path, [](SequenceNumber, ValueType,
+                                              std::string_view, std::string_view) {});
+  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
+TEST(Wal, RejectsAnUnsupportedFormatVersion) {
+  testing_support::ScopedTempDir dir("wal_version");
+  const std::string path = dir.File("000001.log");
+  {
+    WalWriter writer;
+    ASSERT_TRUE(writer.Open(path).ok());
+    ASSERT_TRUE(writer.AddRecord(1, ValueType::kValue, "a", "b").ok());
+    ASSERT_TRUE(writer.Close().ok());
+  }
+  // Bump the version byte; the records themselves are still intact.
+  const int fd = ::open(path.c_str(), O_RDWR);
+  ASSERT_GE(fd, 0);
+  const char future = 99;
+  ASSERT_EQ(::pwrite(fd, &future, 1, 7), 1);
+  ::close(fd);
+
+  const Status s = WalReader::Replay(path, [](SequenceNumber, ValueType,
+                                              std::string_view, std::string_view) {});
+  EXPECT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
 TEST(Wal, SyncOnUnopenedWriterIsAnError) {
   WalWriter writer;
   EXPECT_FALSE(writer.Sync().ok());

@@ -19,6 +19,12 @@ lsm::DB::Open(options, "/var/data/mydb", &db);
 
 db->Put(lsm::WriteOptions(), "user:1", "alice");
 
+// Several writes, applied atomically -- after a crash, all of it or none.
+lsm::WriteBatch batch;
+batch.Put("user:2", "bob");
+batch.Delete("user:1");
+db->Write(lsm::WriteOptions(), batch);
+
 std::string value;
 lsm::Status s = db->Get(lsm::ReadOptions(), "user:1", &value);
 if (s.ok()) { /* value == "alice" */ }
@@ -69,12 +75,19 @@ The WAL append happens *before* the memtable insert. Reversed, a crash could
 leave a value that a reader had already seen but that was never logged — after
 recovery an acknowledged write would simply be gone.
 
+A `WriteBatch` is applied as a unit. Atomicity falls out of the log format
+rather than needing a protocol: the whole batch is one record under one CRC, so
+a crash leaves it complete or leaves a fragment replay discards. There is no
+encoding for half a batch. `Put` and `Delete` are batches of one, which is how
+they get the same guarantee.
+
 ## Components
 
 | Component | Files | Notes |
 |---|---|---|
 | Skip-list memtable | [`include/lsm/skiplist.h`](include/lsm/skiplist.h), [`memtable.h`](include/lsm/memtable.h) | Single writer, lock-free readers |
 | Arena | [`include/lsm/arena.h`](include/lsm/arena.h) | Bump allocator; a memtable is freed whole |
+| Write batches | [`include/lsm/write_batch.h`](include/lsm/write_batch.h), [`src/write_batch.cpp`](src/write_batch.cpp) | Atomic multi-key writes |
 | Write-ahead log | [`include/lsm/wal.h`](include/lsm/wal.h), [`src/wal.cpp`](src/wal.cpp) | CRC-32C per record, three fsync policies |
 | SSTable | [`include/lsm/sstable.h`](include/lsm/sstable.h), [`src/sstable.cpp`](src/sstable.cpp) | Data blocks + sparse index + bloom + footer |
 | Data block format | [`include/lsm/block.h`](include/lsm/block.h), [`src/block.cpp`](src/block.cpp) | Prefix compression + restart points |
@@ -173,6 +186,10 @@ the kernel owns them; it does not survive a kernel panic or a power cut. On
 macOS the sync path uses `F_FULLFSYNC`, since plain `fsync()` there only pushes
 data to the drive, which may still hold it in a volatile write cache.
 
+Each log begins with a magic string and a format version, so a log written by a
+build with a different record format is rejected outright rather than decoded
+into plausible-looking garbage.
+
 Recovery replays every log from the one the manifest names onward. A process
 killed mid-write leaves a short or bad-CRC record at the tail; the reader treats
 the first such record as the end of the log. That is correct because a torn
@@ -188,7 +205,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 133 tests
+ctest --test-dir build --output-on-failure   # 150 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -498,8 +515,10 @@ These are deliberate, not oversights:
   much less, but the per-read option should either work or not exist.
 - **No compression.** Both engines are benchmarked with compression off so the
   comparison is about structure rather than about zlib.
-- **Whole-DB write lock.** One mutex serializes writers. Real engines batch
-  concurrent writes into a group commit and take one fsync for the group.
+- **Whole-DB write lock.** One mutex serializes writers. Real engines merge
+  concurrently-queued batches into a single group commit and take one fsync for
+  the group; the batch machinery is now in place for that, but the queueing is
+  not.
 - **Manifest is rewritten in full**, rather than appended to as a log of edits.
   Simple and atomic, but O(number of files) per compaction.
 
