@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include "lsm/block.h"
 #include "lsm/coding.h"
 #include "lsm/crc32c.h"
 
@@ -69,7 +70,8 @@ struct Table::Stats {
 
 // ---------------------------------------------------------------- TableBuilder
 
-TableBuilder::TableBuilder(const Options& options) : options_(options) {}
+TableBuilder::TableBuilder(const Options& options)
+    : options_(options), block_(options.block_restart_interval) {}
 
 TableBuilder::~TableBuilder() {
   if (fd_ >= 0 && !finished_) Abandon();
@@ -95,13 +97,14 @@ Status TableBuilder::Add(std::string_view internal_key, std::string_view value) 
 
   filter_keys_.emplace_back(ExtractUserKey(internal_key));
 
-  PutLengthPrefixed(&data_block_, internal_key);
-  PutLengthPrefixed(&data_block_, value);
+  block_.Add(internal_key, value);
 
   // Cut the block once it is at least a page. Overshooting by one entry is
   // deliberate: splitting an entry across blocks would force two reads for one
   // lookup.
-  if (data_block_.size() >= options_.block_size_bytes) return FlushDataBlock();
+  if (block_.CurrentSizeEstimate() >= options_.block_size_bytes) {
+    return FlushDataBlock();
+  }
   return Status::OK();
 }
 
@@ -123,10 +126,11 @@ Status TableBuilder::WriteBlock(const std::string& contents, uint64_t* offset,
 }
 
 Status TableBuilder::FlushDataBlock() {
-  if (data_block_.empty()) return Status::OK();
+  if (block_.empty()) return Status::OK();
 
+  const std::string contents = block_.Finish();
   uint64_t offset = 0, size = 0;
-  const Status s = WriteBlock(data_block_, &offset, &size);
+  const Status s = WriteBlock(contents, &offset, &size);
   if (!s.ok()) return s;
 
   // One index entry per block, keyed by the block's largest key: a binary
@@ -135,8 +139,6 @@ Status TableBuilder::FlushDataBlock() {
   PutLengthPrefixed(&index_block_, last_key_in_block_);
   PutFixed64(&index_block_, offset);
   PutFixed64(&index_block_, size);
-
-  data_block_.clear();
   return Status::OK();
 }
 
@@ -350,25 +352,31 @@ bool Table::Get(std::string_view key, SequenceNumber seq, std::string* value,
     return true;  // Surface the I/O error rather than silently reading past it.
   }
 
-  std::string_view rest(*contents);
-  while (!rest.empty()) {
-    std::string_view ikey, val;
-    if (!GetLengthPrefixed(&rest, &ikey) || !GetLengthPrefixed(&rest, &val)) {
-      *status = Status::Corruption(path_ + ": malformed data block");
-      return true;
-    }
-    if (CompareInternalKey(ikey, target) < 0) continue;  // Older or smaller.
-    if (ExtractUserKey(ikey) != key) return false;       // Ran past the key.
-
-    if (ExtractValueType(ikey) == ValueType::kDeletion) {
-      *status = Status::NotFound();
-    } else {
-      value->assign(val.data(), val.size());
-      *status = Status::OK();
-    }
+  // Binary-search the restart points, then decode forward at most one restart
+  // interval -- rather than re-decoding the block from byte zero.
+  BlockReader block(*contents);
+  if (!block.status().ok()) {
+    *status = block.status();
     return true;
   }
-  return false;
+  block.Seek(target);
+  if (!block.status().ok()) {
+    *status = block.status();
+    return true;
+  }
+  if (!block.Valid()) return false;
+
+  const std::string_view ikey = block.key();
+  if (ExtractUserKey(ikey) != key) return false;  // Ran past the key.
+
+  if (ExtractValueType(ikey) == ValueType::kDeletion) {
+    *status = Status::NotFound();
+  } else {
+    const std::string_view val = block.value();
+    value->assign(val.data(), val.size());
+    *status = Status::OK();
+  }
+  return true;
 }
 
 // ------------------------------------------------------------- TableIterator
@@ -381,7 +389,7 @@ class TableIterator : public Iterator {
 
   void SeekToFirst() override {
     block_index_ = 0;
-    LoadBlock();  // Also parses the block's first entry.
+    LoadBlock(nullptr);  // Also positions at the block's first entry.
   }
 
   void Seek(std::string_view target) override {
@@ -396,64 +404,69 @@ class TableIterator : public Iterator {
       }
     }
     block_index_ = lo;
-    if (!LoadBlock()) return;
-    while (valid_ && CompareInternalKey(key_, target) < 0) Next();
+    LoadBlock(&target);
   }
 
   void Next() override {
     if (!valid_) return;
-    if (rest_.empty()) {
-      ++block_index_;
-      if (!LoadBlock()) return;
+    reader_.Next();
+    if (reader_.Valid()) return;
+    if (!reader_.status().ok()) {
+      status_ = reader_.status();
+      valid_ = false;
       return;
     }
-    ParseCurrent();
+    ++block_index_;
+    LoadBlock(nullptr);
   }
 
-  std::string_view key() const override { return key_; }
-  std::string_view value() const override { return value_; }
+  std::string_view key() const override { return reader_.key(); }
+  std::string_view value() const override { return reader_.value(); }
   Status status() const override { return status_; }
 
  private:
-  // Loads block_index_, skipping empty blocks; sets valid_ and the first entry.
-  bool LoadBlock() {
+  // Opens block_index_, skipping empty blocks, and positions the cursor at
+  // `target` (or the block's first entry when target is null).
+  void LoadBlock(const std::string_view* target) {
     while (block_index_ < table_->index_.size()) {
       status_ = table_->ReadBlock(table_->index_[block_index_], &block_);
       if (!status_.ok()) {
         valid_ = false;
-        return false;
+        return;
       }
-      rest_ = std::string_view(*block_);
-      if (!rest_.empty()) {
-        ParseCurrent();
-        return valid_;
+      reader_ = BlockReader(*block_);
+      if (!reader_.status().ok()) {
+        status_ = reader_.status();
+        valid_ = false;
+        return;
+      }
+      if (target != nullptr) {
+        reader_.Seek(*target);
+        // A seek can land past the end of this block; fall through to the next.
+        target = nullptr;
+      } else {
+        reader_.SeekToFirst();
+      }
+      if (!reader_.status().ok()) {
+        status_ = reader_.status();
+        valid_ = false;
+        return;
+      }
+      if (reader_.Valid()) {
+        valid_ = true;
+        return;
       }
       ++block_index_;
     }
     valid_ = false;
-    return false;
-  }
-
-  void ParseCurrent() {
-    std::string_view k, v;
-    if (!GetLengthPrefixed(&rest_, &k) || !GetLengthPrefixed(&rest_, &v)) {
-      status_ = Status::Corruption(table_->path() + ": malformed data block");
-      valid_ = false;
-      return;
-    }
-    key_ = k;
-    value_ = v;
-    valid_ = true;
   }
 
   const Table* table_;
   size_t block_index_ = 0;
-  // Keeps the bytes key_/value_ point into alive, even if the cache evicts the
+  // Keeps the bytes the reader points into alive, even if the cache evicts the
   // block while this cursor is still walking it.
   BlockCache::Handle block_;
-  std::string_view rest_;     // Unparsed remainder of block_.
-  std::string_view key_;
-  std::string_view value_;
+  BlockReader reader_;
   bool valid_ = false;
   Status status_;
 };

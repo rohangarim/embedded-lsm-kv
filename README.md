@@ -77,6 +77,7 @@ recovery an acknowledged write would simply be gone.
 | Arena | [`include/lsm/arena.h`](include/lsm/arena.h) | Bump allocator; a memtable is freed whole |
 | Write-ahead log | [`include/lsm/wal.h`](include/lsm/wal.h), [`src/wal.cpp`](src/wal.cpp) | CRC-32C per record, three fsync policies |
 | SSTable | [`include/lsm/sstable.h`](include/lsm/sstable.h), [`src/sstable.cpp`](src/sstable.cpp) | Data blocks + sparse index + bloom + footer |
+| Data block format | [`include/lsm/block.h`](include/lsm/block.h), [`src/block.cpp`](src/block.cpp) | Prefix compression + restart points |
 | Bloom filter | [`include/lsm/bloom.h`](include/lsm/bloom.h), [`src/bloom.cpp`](src/bloom.cpp) | Configurable bits/key, double hashing |
 | Block cache | [`include/lsm/cache.h`](include/lsm/cache.h), [`src/cache.cpp`](src/cache.cpp) | Sharded LRU over decoded data blocks |
 | Levels, compaction, recovery | [`include/lsm/db.h`](include/lsm/db.h), [`src/db.cpp`](src/db.cpp) | 7 levels, 10× growth, MVCC on file metadata |
@@ -96,7 +97,7 @@ live in a deeper SSTable, and only compaction can drop both together.
 
 ```
 +------------------+
-| data block 0     |  [key_len][internal key][value_len][value] ... + crc32c
+| data block 0     |  prefix-compressed entries + restart array + crc32c
 | data block 1     |
 | ...              |
 +------------------+
@@ -112,8 +113,26 @@ Blocks exist because storage is addressed in pages: a point lookup should
 transfer one ~4 KiB chunk, not the whole file and not a byte at a time. The
 index is *sparse* — one entry per block, not per key — so it stays small enough
 to hold resident, and a lookup is a binary search in memory plus exactly one
-block read. Within a block, a linear scan beats a binary search: it is a single
-sequential pass over bytes already in L1 cache.
+block read.
+
+Inside a block:
+
+```
+entry:   [shared:varint32][non_shared:varint32][value_len:varint32]
+         [key suffix][value]
+trailer: [restart_0:u32] ... [restart_k:u32][num_restarts:u32]
+```
+
+Keys arrive sorted, so neighbours share long prefixes — `user0000000000123456`
+and `user0000000000123457` differ in one byte. An entry stores only what differs
+from its predecessor. Every 16th entry resets to a whole key and records its
+offset in the restart array, which is what keeps the block searchable: a lookup
+binary-searches the restart points and then decodes forward through at most one
+interval, rather than walking the block from byte zero.
+
+Both effects are measurable. Prefix compression alone cuts a 200-entry block of
+these keys by 15.9%, and the whole 500 000-key database now occupies 57 MiB on
+disk — the same as LevelDB, which uses the same technique.
 
 ### Read path
 
@@ -161,7 +180,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 103 tests
+ctest --test-dir build --output-on-failure   # 119 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -228,43 +247,56 @@ caches. Checksum verification is **on** for lsmtree; LevelDB's default
 (`verify_checksums = false`) is left alone, so this is the harder configuration
 for us.
 
+Both engines run back-to-back on an otherwise idle machine, with matched 4 MiB
+write buffers, 4 KiB blocks, 10-bits-per-key Bloom filters and 8 MiB block
+caches. Checksum verification is **on** for lsmtree; LevelDB's default
+(`verify_checksums = false`) is left alone, so this is the harder configuration
+for us.
+
 Throughput, operations per second:
 
 | Workload | Mix | lsmtree | LevelDB | Ratio |
 |---|---|---:|---:|---:|
-| load | 100% insert | 381 895 | 489 438 | 0.78x |
-| A | 50% read / 50% update | **437 989** | 280 197 | **1.56x** |
-| B | 95% read / 5% update | **764 816** | 704 109 | **1.09x** |
-| C | 100% read | 996 459 | 1 293 279 | 0.77x |
-| D | 95% read latest / 5% insert | 1 136 292 | 1 263 159 | 0.90x |
-| E | 95% scan (50 rows) / 5% insert | 19 030 | 243 579 | 0.08x |
-| F | 50% read / 50% read-modify-write | **348 869** | 238 502 | **1.46x** |
+| load | 100% insert | 400 584 | 501 042 | 0.80x |
+| A | 50% read / 50% update | **425 103** | 281 847 | **1.51x** |
+| B | 95% read / 5% update | **745 869** | 706 270 | **1.06x** |
+| C | 100% read | 1 124 304 | 1 326 521 | 0.85x |
+| D | 95% read latest / 5% insert | 1 215 172 | 1 284 937 | 0.95x |
+| E | 95% scan (50 rows) / 5% insert | 18 007 | 247 936 | 0.07x |
+| F | 50% read / 50% read-modify-write | **349 251** | 236 711 | **1.48x** |
+
+On-disk size after the load is 57 MiB for both engines.
 
 Latency, microseconds (lsmtree):
 
 | Workload | p50 | p95 | p99 | p99.9 |
 |---|---:|---:|---:|---:|
-| load | 1.38 | 2.75 | 4.58 | 12.54 |
-| A | 1.50 | 3.29 | 4.62 | 13.75 |
-| B | 0.50 | 2.92 | 3.62 | 8.25 |
-| C | 0.46 | 2.58 | 3.08 | 4.67 |
-| D | 0.33 | 2.58 | 3.21 | 4.67 |
-| E | 17.00 | 219.79 | 238.29 | 309.29 |
-| F | 1.96 | 5.08 | 6.75 | 14.29 |
+| load | 1.42 | 2.92 | 5.04 | 27.12 |
+| A | 1.54 | 3.25 | 4.83 | 15.42 |
+| B | 0.50 | 2.88 | 3.92 | 10.88 |
+| C | 0.46 | 2.42 | 2.88 | 5.08 |
+| D | 0.33 | 2.42 | 2.79 | 4.25 |
+| E | 11.83 | 248.08 | 263.79 | 547.67 |
+| F | 1.88 | 5.21 | 7.08 | 23.04 |
+
+Maxima are omitted from that table because they are dominated by multi-second
+OS-level I/O stalls that appear in both engines, including in `load`, which has
+no readers to block. The benchmark still prints them, for the reason described
+under "Tail latency" below.
 
 ### How it got here
 
 Three changes, each measured, on the read path. Same hardware and workloads
 throughout:
 
-| Workload | Baseline | + block cache | + fast CRC-32C | LevelDB |
+| Workload | Baseline | + block cache | + fast CRC-32C | + prefix compression |
 |---|---:|---:|---:|---:|
-| A | 245 559 | 233 817 | **437 989** | 280 197 |
-| B | 209 565 | 273 890 | **764 816** | 704 109 |
-| C | 193 454 | 266 032 | **996 459** | 1 293 279 |
-| D | 293 905 | 377 117 | **1 136 292** | 1 263 159 |
-| E | 1 489 | 12 271 | **19 030** | 243 579 |
-| F | 156 129 | 176 693 | **348 869** | 238 502 |
+| A | 245 559 | 233 817 | 437 989 | **425 103** |
+| B | 209 565 | 273 890 | 764 816 | **745 869** |
+| C | 193 454 | 266 032 | 996 459 | **1 124 304** |
+| D | 293 905 | 377 117 | 1 136 292 | **1 215 172** |
+| E | 1 489 | 12 271 | 19 030 | **18 007** |
+| F | 156 129 | 176 693 | 348 869 | **349 251** |
 
 **The merging iterator** was the first fix, before the table above. `NewIterator`
 gave the merge one cursor per *file*, so every `Seek` read a block out of every
@@ -275,6 +307,13 @@ file in every level. One concatenating cursor per level below L0 took scans from
 986 249 to 201 758, at a 93.8% hit rate. Scans gained most (+724%) because they
 were paying worst: stepping over the shadowed versions of a Zipfian-hot key could
 touch a hundred blocks for one logical row.
+
+**Prefix compression and restart points** came last, and did two things: point
+reads gained 7–13% from binary-searching restart points instead of decoding a
+block from its first byte, and the database shrank to exactly LevelDB's on-disk
+size. Workloads A, B and F moved by less than run-to-run noise, and scans not at
+all — the honest reading is that this was a size win with a modest read bonus,
+not a throughput change.
 
 **CRC-32C** turned out to be the whole remaining read gap, which was not obvious
 until it was measured. Point-read p95 sat at a suspiciously flat ~11 µs across
@@ -373,10 +412,6 @@ These are deliberate, not oversights:
 - **Scan setup costs ~2.4 µs** before a single row is read — an iterator per L0
   file plus one per level, each seeking a block. At the default 50-row scan that
   is about a third of the total.
-- **No restart points or prefix compression in data blocks.** Keys are stored
-  whole and located by a linear walk from the start of the block. LevelDB's
-  restart intervals give both a binary search within the block and a smaller
-  file.
 - **`ReadOptions::verify_checksums` is ignored.** Verification is controlled by
   the database-wide `Options` only. Now that verification is cheap this matters
   much less, but the per-read option should either work or not exist.

@@ -31,6 +31,7 @@ endif()
 
 add_library(lsm
   src/arena.cpp
+  src/block.cpp
   src/bloom.cpp
   src/cache.cpp
   src/crc32c.cpp
@@ -86,6 +87,7 @@ if(LSM_BUILD_TESTS)
   enable_testing()
   add_executable(lsm_tests
     tests/test_arena.cpp
+    tests/test_block.cpp
     tests/test_bloom.cpp
     tests/test_cache.cpp
     tests/test_crc32c.cpp

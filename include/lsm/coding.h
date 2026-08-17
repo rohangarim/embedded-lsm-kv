@@ -43,6 +43,36 @@ inline void PutLengthPrefixed(std::string* dst, std::string_view value) {
   dst->append(value.data(), value.size());
 }
 
+// Varint32: 7 bits of payload per byte, high bit set while more bytes follow.
+// Used inside data blocks, where the three per-entry lengths are almost always
+// small enough for one byte each -- a fixed32 apiece would cost 9 wasted bytes
+// on a ~130-byte record.
+inline void PutVarint32(std::string* dst, uint32_t value) {
+  while (value >= 0x80) {
+    dst->push_back(static_cast<char>(value | 0x80));
+    value >>= 7;
+  }
+  dst->push_back(static_cast<char>(value));
+}
+
+// Decodes a varint32 at `p`. Returns the byte after it, or nullptr if the
+// encoding runs past `limit` or is longer than 5 bytes.
+inline const char* GetVarint32Ptr(const char* p, const char* limit,
+                                  uint32_t* value) {
+  uint32_t result = 0;
+  for (int shift = 0; shift <= 28 && p < limit; shift += 7) {
+    const uint32_t byte = static_cast<uint8_t>(*p++);
+    if (byte & 0x80) {
+      result |= (byte & 0x7f) << shift;
+    } else {
+      result |= byte << shift;
+      *value = result;
+      return p;
+    }
+  }
+  return nullptr;
+}
+
 // Consumes one length-prefixed string from *input. Returns false (leaving
 // *input untouched) if the buffer is truncated.
 inline bool GetLengthPrefixed(std::string_view* input, std::string_view* result) {

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "lsm/block.h"
 #include "lsm/bloom.h"
 #include "lsm/cache.h"
 #include "lsm/internal_key.h"
@@ -26,11 +27,21 @@ namespace lsm {
 //
 // Every block is followed by a 4-byte CRC of its contents.
 //
-// Data block contents: a run of [key_len:4][internal key][value_len:4][value],
-// sorted. Blocks exist because storage is addressed in pages: a point lookup
-// should transfer one ~4 KiB chunk, not the whole file and not a byte at a
-// time. Within a block a linear scan beats a binary search -- it is one
-// sequential pass over data already in L1 cache.
+// Data block contents: prefix-compressed entries followed by a restart array.
+//
+//   entry:   [shared:varint32][non_shared:varint32][value_len:varint32]
+//            [key suffix bytes][value bytes]
+//   trailer: [restart_0:u32] ... [restart_k:u32][num_restarts:u32]
+//
+// Keys arrive sorted, so consecutive ones share long prefixes -- an entry
+// stores only the bytes that differ from its predecessor. Every
+// block_restart_interval-th entry resets to a whole key and records its offset
+// in the restart array. Those restart points are what keep the block
+// searchable: a lookup binary-searches them and then decodes forward through at
+// most one interval, instead of walking the block from byte zero.
+//
+// Blocks exist because storage is addressed in pages: a point lookup should
+// transfer one ~4 KiB chunk, not the whole file and not a byte at a time.
 //
 // Index block contents: one [key_len:4][last key in block][offset:8][size:8]
 // entry per data block. The index is *sparse* -- one entry per block, not per
@@ -39,7 +50,10 @@ namespace lsm {
 //
 // Footer: index_offset, index_size, bloom_offset, bloom_size, magic.
 constexpr size_t kFooterSize = 40;
-constexpr uint64_t kTableMagic = 0x4c534d5442aa5501ull;
+// Bumped when the data block format gained restart points and prefix
+// compression. An older file now fails at open with a clear corruption error
+// rather than being decoded as garbage.
+constexpr uint64_t kTableMagic = 0x4c534d5442aa5502ull;
 constexpr size_t kBlockTrailerSize = 4;  // crc32c
 
 // Immutable-file writer. Keys must be added in ascending internal-key order.
@@ -77,7 +91,7 @@ class TableBuilder {
   int fd_ = -1;
   bool finished_ = false;
 
-  std::string data_block_;   // Buffer for the block being built.
+  BlockBuilder block_;       // Data block under construction.
   std::string index_block_;  // Accumulated index entries.
   std::string last_key_in_block_;
 

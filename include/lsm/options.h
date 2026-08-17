@@ -29,6 +29,12 @@ struct Options {
   // so a point lookup reads one page-sized chunk instead of the whole file.
   size_t block_size_bytes = 4096;
 
+  // How many entries share a prefix-compression run inside a data block. Every
+  // Nth key is stored whole and becomes a binary-search landing point; the ones
+  // between store only the bytes that differ from their predecessor. Smaller is
+  // faster to search and larger compresses better -- 16 is the usual balance.
+  int block_restart_interval = 16;
+
   // Bits of Bloom filter per key. 10 bits/key gives ~1% false positives.
   int bloom_bits_per_key = 10;
 
