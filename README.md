@@ -180,7 +180,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 119 tests
+ctest --test-dir build --output-on-failure   # 122 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -253,17 +253,23 @@ caches. Checksum verification is **on** for lsmtree; LevelDB's default
 (`verify_checksums = false`) is left alone, so this is the harder configuration
 for us.
 
+Both engines run back-to-back on an otherwise idle machine, with matched 4 MiB
+write buffers, 4 KiB blocks, 10-bits-per-key Bloom filters and 8 MiB block
+caches. Checksum verification is **on** for lsmtree; LevelDB's default
+(`verify_checksums = false`) is left alone, so this is the harder configuration
+for us.
+
 Throughput, operations per second:
 
 | Workload | Mix | lsmtree | LevelDB | Ratio |
 |---|---|---:|---:|---:|
-| load | 100% insert | 400 584 | 501 042 | 0.80x |
-| A | 50% read / 50% update | **425 103** | 281 847 | **1.51x** |
-| B | 95% read / 5% update | **745 869** | 706 270 | **1.06x** |
-| C | 100% read | 1 124 304 | 1 326 521 | 0.85x |
-| D | 95% read latest / 5% insert | 1 215 172 | 1 284 937 | 0.95x |
-| E | 95% scan (50 rows) / 5% insert | 18 007 | 247 936 | 0.07x |
-| F | 50% read / 50% read-modify-write | **349 251** | 236 711 | **1.48x** |
+| load | 100% insert | 420 957 | 518 446 | 0.81x |
+| A | 50% read / 50% update | **466 840** | 285 250 | **1.64x** |
+| B | 95% read / 5% update | **889 181** | 704 649 | **1.26x** |
+| C | 100% read | 1 215 797 | 1 357 462 | 0.90x |
+| D | 95% read latest / 5% insert | 1 254 512 | 1 325 628 | 0.95x |
+| E | 95% scan (50 rows) / 5% insert | 151 313 | 249 565 | 0.61x |
+| F | 50% read / 50% read-modify-write | **391 741** | 244 305 | **1.60x** |
 
 On-disk size after the load is 57 MiB for both engines.
 
@@ -271,13 +277,13 @@ Latency, microseconds (lsmtree):
 
 | Workload | p50 | p95 | p99 | p99.9 |
 |---|---:|---:|---:|---:|
-| load | 1.42 | 2.92 | 5.04 | 27.12 |
-| A | 1.54 | 3.25 | 4.83 | 15.42 |
-| B | 0.50 | 2.88 | 3.92 | 10.88 |
-| C | 0.46 | 2.42 | 2.88 | 5.08 |
-| D | 0.33 | 2.42 | 2.79 | 4.25 |
-| E | 11.83 | 248.08 | 263.79 | 547.67 |
-| F | 1.88 | 5.21 | 7.08 | 23.04 |
+| load | 1.33 | 2.62 | 4.42 | 14.04 |
+| A | 1.38 | 3.08 | 4.42 | 10.50 |
+| B | 0.42 | 2.58 | 3.21 | 6.08 |
+| C | 0.42 | 2.29 | 2.67 | 3.92 |
+| D | 0.29 | 2.33 | 2.83 | 4.83 |
+| E | 6.67 | 8.67 | 10.08 | 14.67 |
+| F | 1.75 | 4.67 | 6.17 | 13.38 |
 
 Maxima are omitted from that table because they are dominated by multi-second
 OS-level I/O stalls that appear in both engines, including in `load`, which has
@@ -289,14 +295,14 @@ under "Tail latency" below.
 Three changes, each measured, on the read path. Same hardware and workloads
 throughout:
 
-| Workload | Baseline | + block cache | + fast CRC-32C | + prefix compression |
-|---|---:|---:|---:|---:|
-| A | 245 559 | 233 817 | 437 989 | **425 103** |
-| B | 209 565 | 273 890 | 764 816 | **745 869** |
-| C | 193 454 | 266 032 | 996 459 | **1 124 304** |
-| D | 293 905 | 377 117 | 1 136 292 | **1 215 172** |
-| E | 1 489 | 12 271 | 19 030 | **18 007** |
-| F | 156 129 | 176 693 | 348 869 | **349 251** |
+| Workload | Baseline | + block cache | + fast CRC-32C | + prefix compression | + flush collapse |
+|---|---:|---:|---:|---:|---:|
+| A | 245 559 | 233 817 | 437 989 | 425 103 | **466 840** |
+| B | 209 565 | 273 890 | 764 816 | 745 869 | **889 181** |
+| C | 193 454 | 266 032 | 996 459 | 1 124 304 | **1 215 797** |
+| D | 293 905 | 377 117 | 1 136 292 | 1 215 172 | **1 254 512** |
+| E | 1 489 | 12 271 | 19 030 | 18 007 | **151 313** |
+| F | 156 129 | 176 693 | 348 869 | 349 251 | **391 741** |
 
 **The merging iterator** was the first fix, before the table above. `NewIterator`
 gave the merge one cursor per *file*, so every `Seek` read a block out of every
@@ -308,7 +314,11 @@ file in every level. One concatenating cursor per level below L0 took scans from
 were paying worst: stepping over the shadowed versions of a Zipfian-hot key could
 touch a hundred blocks for one logical row.
 
-**Prefix compression and restart points** came last, and did two things: point
+**Collapsing shadowed versions at flush time** was the largest single change,
+and it is described in full below because finding it mattered more than fixing
+it did.
+
+**Prefix compression and restart points** did two things: point
 reads gained 7–13% from binary-searching restart points instead of decoding a
 block from its first byte, and the database shrank to exactly LevelDB's on-disk
 size. Workloads A, B and F moved by less than run-to-run noise, and scans not at
@@ -374,21 +384,63 @@ comparable to the table above, which was taken on an idle machine. Multi-second
 maxima also persist and are I/O stalls at the OS level rather than lock
 contention — they show up in the `load` workload, which has no readers to block.
 
-### Why scans are still 0.08x
+### Finding the scan bottleneck
 
-Workload E is the one remaining large gap, and the cause is understood rather
-than mysterious. `MergingIterator::FindSmallest` is a linear scan over its
-children: with L0 files plus one cursor per deeper level, every `Next()` costs
-~20 comparisons. That is fine for compaction, which merges a handful of files,
-but a range scan after heavy update churn has to step over every shadowed
-version of each hot key to reach the next live one — so the linear scan is paid
-hundreds of times per logical row. A binary heap makes each step O(log n)
-instead, and that is the next thing to build.
+Scans ran at 0.07x of LevelDB for a long time, and three plausible-sounding
+explanations turned out to be wrong before the real one showed up. Recording the
+sequence because the wrong turns are the instructive part.
 
-The measurement that isolates it: E runs at ~228 000 ops/sec when the workload
-sequence is `load, C, E`, and ~19 000 in the full `load, A, B, C, D, F, E`
-sequence, at identical level shapes. The difference is entirely how many
-shadowed versions the scan has to walk.
+The first fix was real but small: the merge held one cursor per *file*, so every
+`Seek` read a block out of every file in every level. One concatenating cursor
+per level below L0 took scans from 1 141 to ~20 000 ops/sec. Then the merge's
+linear `FindSmallest` was replaced with a binary heap — obviously better
+asymptotically, worth +31%, and not the bottleneck. Then the per-scan copy of a
+level's file vector, worth a few percent.
+
+At that point scans were at 19 000 against LevelDB's 248 000 and the remaining
+theories were getting thin. What settled it was measuring the right quantity
+instead of guessing at causes: a counter for how many stored entries a scan
+steps over — shadowed versions, tombstones, versions newer than the snapshot —
+per live row it returns.
+
+```
+scan rows returned     24 218 268
+scan entries skipped  998 936 071   (41.2 per row returned)
+```
+
+Forty-one dead entries walked for every live row. And varying the preceding
+workloads isolated it completely:
+
+| Preceding workloads | Skipped per row | Scan ops/sec |
+|---|---:|---:|
+| load only | 1.0 | 248 108 |
+| load, A | 16.8 | 64 060 |
+| load, A, B, C, D, F | 61.5 | 16 604 |
+
+With no update churn, scans matched LevelDB almost exactly — 248 108 against
+249 565. Nothing was wrong with the iterator at all; the engine was storing
+dozens of dead versions of every hot key and the scan was dutifully walking all
+of them.
+
+They came from the flush. Compaction had always collapsed each key to its newest
+version, but writing a memtable out to L0 dumped every version verbatim. Under a
+Zipfian update workload a 4 MiB memtable holds *thousands* of versions of its
+hottest keys, and all of them landed in the L0 file. Applying compaction's own
+rule to the flush took skips from 41.2 to 2.1 per row and scans from 19 030 to
+151 313 — and lifted every read workload by 8–19% as a side effect, since point
+lookups had been scanning past those versions too.
+
+Why this is safe without a snapshot API, and what would break it: nothing can be
+pinned to a sequence older than the newest version being kept. Readers that
+already exist hold the memtable itself through a `shared_ptr` and keep reading it
+rather than the new file; any reader created afterwards takes the current
+sequence number, which is at or above every sequence in that memtable. Adding
+snapshots would invalidate that argument — and would invalidate compaction's
+identical rule in exactly the same way.
+
+The remaining 0.61x is ordinary per-row cost: iterator setup is ~2.4 µs before
+the first row, and each row costs ~85 ns against LevelDB's ~80 ns for the whole
+50-row scan.
 
 ### Bloom filter false-positive rates
 
@@ -410,8 +462,9 @@ in the single-table test — the filter rejects it outright.
 These are deliberate, not oversights:
 
 - **Scan setup costs ~2.4 µs** before a single row is read — an iterator per L0
-  file plus one per level, each seeking a block. At the default 50-row scan that
-  is about a third of the total.
+  file plus one per level, each seeking a block, and roughly ten heap
+  allocations. At the default 50-row scan that is about a third of the total,
+  and it is the largest remaining scan cost.
 - **`ReadOptions::verify_checksums` is ignored.** Verification is controlled by
   the database-wide `Options` only. Now that verification is cheap this matters
   much less, but the per-read option should either work or not exist.

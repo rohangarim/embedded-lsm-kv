@@ -300,6 +300,101 @@ TEST(DB, StatsTrackWriteAmplification) {
               static_cast<unsigned long long>(stats.compactions));
 }
 
+// A memtable under a skewed update workload holds many versions of its hot
+// keys. Writing them all out makes every later scan step over them, so the
+// flush collapses each key to its newest version -- the same rule compaction
+// applies.
+TEST(DB, FlushCollapsesShadowedVersions) {
+  ScopedTempDir dir("db_flush_dedup");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  constexpr int kKeys = 50;
+  constexpr int kVersionsPerKey = 200;
+  for (int round = 0; round < kVersionsPerKey; ++round) {
+    for (int i = 0; i < kKeys; ++i) {
+      ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(round * 1000 + i)).ok());
+    }
+  }
+  ASSERT_TRUE(db->FlushMemTable().ok());
+
+  const DbStats stats = db->GetStats();
+  EXPECT_GT(stats.flush_versions_dropped, 0u);
+
+  // Only the newest version of each key survives, and it is the right one.
+  for (int i = 0; i < kKeys; ++i) {
+    EXPECT_EQ(MustGet(db.get(), Key(i)), Value((kVersionsPerKey - 1) * 1000 + i))
+        << i;
+  }
+
+  // And a scan walks 50 live rows, not 10 000 stored entries.
+  auto iter = db->NewIterator(ReadOptions());
+  int rows = 0;
+  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) ++rows;
+  EXPECT_EQ(rows, kKeys);
+
+  const DbStats after = db->GetStats();
+  EXPECT_LT(after.scan_entries_skipped, static_cast<uint64_t>(kKeys) * 2)
+      << "scan should not be stepping over collapsed versions";
+}
+
+// The collapse must not change what a reader sees at any point -- including a
+// reader that was already iterating when the flush happened.
+TEST(DB, FlushCollapseIsInvisibleToAnOpenIterator) {
+  ScopedTempDir dir("db_flush_dedup_iter");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  constexpr int kKeys = 200;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  // Overwrite everything so the memtable holds two versions of every key.
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i + 500000)).ok());
+  }
+
+  auto iter = db->NewIterator(ReadOptions());
+  iter->SeekToFirst();
+  ASSERT_TRUE(iter->Valid());
+
+  ASSERT_TRUE(db->FlushMemTable().ok());  // Collapses under the open iterator.
+
+  int rows = 0;
+  for (; iter->Valid(); iter->Next()) {
+    ASSERT_EQ(iter->key(), Key(rows));
+    EXPECT_EQ(iter->value(), Value(rows + 500000));
+    ++rows;
+  }
+  EXPECT_EQ(rows, kKeys);
+  EXPECT_TRUE(iter->status().ok());
+
+  for (int i = 0; i < kKeys; ++i) {
+    EXPECT_EQ(MustGet(db.get(), Key(i)), Value(i + 500000)) << i;
+  }
+}
+
+TEST(DB, DeletesStillWinAfterFlushCollapse) {
+  ScopedTempDir dir("db_flush_dedup_delete");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  // Put/delete/put/delete within one memtable: the tombstone is newest and must
+  // be what survives the collapse.
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+    ASSERT_TRUE(db->Delete(WriteOptions(), Key(i)).ok());
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i + 1)).ok());
+    if (i % 2 == 0) ASSERT_TRUE(db->Delete(WriteOptions(), Key(i)).ok());
+  }
+  ASSERT_TRUE(db->FlushMemTable().ok());
+
+  for (int i = 0; i < 100; ++i) {
+    if (i % 2 == 0) {
+      ExpectMissing(db.get(), Key(i));
+    } else {
+      EXPECT_EQ(MustGet(db.get(), Key(i)), Value(i + 1)) << i;
+    }
+  }
+}
+
 TEST(DB, BackgroundCompactionKeepsDataCorrect) {
   ScopedTempDir dir("db_background");
   Options options = SmallOptions();

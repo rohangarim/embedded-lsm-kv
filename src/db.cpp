@@ -600,13 +600,36 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
   // memtable while this runs, which is the point of having an immutable one.
   lock.unlock();
   Status s;
+  uint64_t versions_dropped = 0;
   {
     TableBuilder builder(options_);
     s = builder.Open(table_path);
     if (s.ok()) {
+      // Keep only the newest version of each key. A memtable under a skewed
+      // update workload holds many versions of its hot keys -- thousands, at a
+      // 4 MiB buffer -- and dumping them verbatim means every later range scan
+      // has to step over all of them to reach the next live row.
+      //
+      // Safe because nothing can be pinned to a sequence older than the newest
+      // version being kept: readers that already exist hold this memtable
+      // itself through a shared_ptr and keep reading it rather than the new
+      // file, and any reader created afterwards takes the current sequence
+      // number, which is at or above every sequence in here. Adding a snapshot
+      // API would break that argument -- and would break compaction's identical
+      // rule in the same way.
       MemTable::Iterator it(imm.get());
+      std::string last_user_key;
+      bool have_last_user_key = false;
       for (it.SeekToFirst(); it.Valid(); it.Next()) {
-        s = builder.Add(it.internal_key(), it.value());
+        const std::string_view ikey = it.internal_key();
+        const std::string_view user_key = ExtractUserKey(ikey);
+        if (have_last_user_key && user_key == last_user_key) {
+          ++versions_dropped;
+          continue;  // Shadowed by a newer version already written.
+        }
+        last_user_key.assign(user_key);
+        have_last_user_key = true;
+        s = builder.Add(ikey, it.value());
         if (!s.ok()) break;
       }
     }
@@ -644,6 +667,7 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
   }
   ++stats_.memtable_flushes;
   stats_.flush_output_bytes += meta->file_size;
+  stats_.flush_versions_dropped += versions_dropped;
 
   bg_cv_.notify_all();
   return Status::OK();
@@ -980,6 +1004,10 @@ DbStats DB::GetStats() const {
   snapshot.get_hits_memtable =
       stat_get_hits_memtable_.load(std::memory_order_relaxed);
   snapshot.tables_probed = stat_tables_probed_.load(std::memory_order_relaxed);
+  snapshot.scan_entries_returned =
+      stat_scan_returned_.load(std::memory_order_relaxed);
+  snapshot.scan_entries_skipped =
+      stat_scan_skipped_.load(std::memory_order_relaxed);
   for (const auto& level : current_->levels) {
     for (const auto& f : level) {
       snapshot.sstable_blocks_read += f->table->blocks_read();
@@ -1117,8 +1145,18 @@ class LevelIterator : public Iterator {
 class DBIter : public Iterator {
  public:
   DBIter(std::unique_ptr<Iterator> inner, SequenceNumber seq,
-         std::shared_ptr<const Version> version)
-      : inner_(std::move(inner)), seq_(seq), version_(std::move(version)) {}
+         std::shared_ptr<const Version> version,
+         std::atomic<uint64_t>* returned, std::atomic<uint64_t>* skipped)
+      : inner_(std::move(inner)),
+        seq_(seq),
+        version_(std::move(version)),
+        returned_(returned),
+        skipped_(skipped) {}
+
+  ~DBIter() override {
+    returned_->fetch_add(returned_count_, std::memory_order_relaxed);
+    skipped_->fetch_add(skipped_count_, std::memory_order_relaxed);
+  }
 
   bool Valid() const override { return valid_; }
 
@@ -1144,7 +1182,10 @@ class DBIter : public Iterator {
 
  private:
   void SkipRestOfCurrentKey() {
-    while (inner_->Valid() && ExtractUserKey(inner_->key()) == key_) inner_->Next();
+    while (inner_->Valid() && ExtractUserKey(inner_->key()) == key_) {
+      inner_->Next();
+      ++skipped_count_;
+    }
   }
 
   void AdvanceToNextLiveKey() {
@@ -1152,6 +1193,7 @@ class DBIter : public Iterator {
       const std::string_view ikey = inner_->key();
       if (ExtractSequence(ikey) > seq_) {  // Not visible in this snapshot.
         inner_->Next();
+        ++skipped_count_;
         continue;
       }
       key_.assign(ExtractUserKey(ikey));
@@ -1162,6 +1204,7 @@ class DBIter : public Iterator {
       const std::string_view v = inner_->value();
       value_.assign(v.data(), v.size());
       valid_ = true;
+      ++returned_count_;
       return;
     }
     valid_ = false;
@@ -1170,6 +1213,12 @@ class DBIter : public Iterator {
   std::unique_ptr<Iterator> inner_;
   SequenceNumber seq_;
   std::shared_ptr<const Version> version_;  // Keeps the referenced tables alive.
+  std::atomic<uint64_t>* returned_;
+  std::atomic<uint64_t>* skipped_;
+  // Accumulated locally and published once on destruction, so a scan does not
+  // hit a shared atomic on every row.
+  uint64_t returned_count_ = 0;
+  uint64_t skipped_count_ = 0;
   std::string key_;
   std::string value_;
   bool valid_ = false;
@@ -1205,7 +1254,8 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& opts) {
     children.push_back(std::make_unique<LevelIterator>(version, level));
   }
   return std::make_unique<DBIter>(NewMergingIterator(std::move(children)), seq,
-                                  version);
+                                  version, &stat_scan_returned_,
+                                  &stat_scan_skipped_);
 }
 
 }  // namespace lsm

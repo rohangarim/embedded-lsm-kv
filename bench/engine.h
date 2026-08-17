@@ -112,6 +112,9 @@ class LsmEngine : public Engine {
         "  block cache hit rate   %.1f%% (%llu hits / %llu misses)\n"
         "  block cache evictions  %llu\n"
         "  block cache resident   %.1f MiB\n"
+        "  flush versions dropped %llu\n"
+        "  scan rows returned     %llu\n"
+        "  scan entries skipped   %llu (%.1f per row returned)\n"
         "\nlevel shape\n%s",
         (unsigned long long)stats.writes, (unsigned long long)stats.wal_syncs,
         (unsigned long long)stats.memtable_flushes,
@@ -126,6 +129,13 @@ class LsmEngine : public Engine {
         (unsigned long long)stats.block_cache_misses,
         (unsigned long long)stats.block_cache_evictions,
         stats.block_cache_bytes_used / 1048576.0,
+        (unsigned long long)stats.flush_versions_dropped,
+        (unsigned long long)stats.scan_entries_returned,
+        (unsigned long long)stats.scan_entries_skipped,
+        stats.scan_entries_returned == 0
+            ? 0.0
+            : static_cast<double>(stats.scan_entries_skipped) /
+                  static_cast<double>(stats.scan_entries_returned),
         db_->DebugLevelSummary().c_str());
     return buf;
   }

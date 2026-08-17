@@ -59,6 +59,8 @@ struct DbStats {
   uint64_t compaction_input_bytes = 0;
   uint64_t compaction_output_bytes = 0;
   uint64_t flush_output_bytes = 0;
+  // Shadowed versions collapsed while writing a memtable out to L0.
+  uint64_t flush_versions_dropped = 0;
   uint64_t bytes_written_to_wal = 0;
   uint64_t user_bytes_written = 0;
   uint64_t gets = 0;
@@ -70,6 +72,13 @@ struct DbStats {
   uint64_t block_cache_misses = 0;
   uint64_t block_cache_evictions = 0;
   size_t block_cache_bytes_used = 0;
+
+  // Iterator work. `scan_entries_skipped` counts stored entries a scan had to
+  // step over -- shadowed versions, tombstones, and versions newer than the
+  // snapshot -- to produce `scan_entries_returned` live rows. The ratio is the
+  // read amplification a range scan actually pays.
+  uint64_t scan_entries_returned = 0;
+  uint64_t scan_entries_skipped = 0;
 
   // Fraction of data-block reads served from memory rather than the
   // filesystem.
@@ -208,6 +217,8 @@ class DB {
   mutable std::atomic<uint64_t> stat_gets_{0};
   mutable std::atomic<uint64_t> stat_get_hits_memtable_{0};
   mutable std::atomic<uint64_t> stat_tables_probed_{0};
+  mutable std::atomic<uint64_t> stat_scan_returned_{0};
+  mutable std::atomic<uint64_t> stat_scan_skipped_{0};
 };
 
 }  // namespace lsm
