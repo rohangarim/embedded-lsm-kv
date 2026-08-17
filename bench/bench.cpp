@@ -121,6 +121,19 @@ class LatencyRecorder {
   // Sorts in place; call once, after all samples are in.
   void Finalize() { std::sort(samples_.begin(), samples_.end()); }
 
+  double MaxMicros() const {
+    return samples_.empty() ? 0.0
+                            : static_cast<double>(samples_.back()) / 1000.0;
+  }
+
+  // Sum of all recorded latencies. Compared against wall time, this is what
+  // reveals whether the percentiles actually account for where the run went.
+  double TotalSeconds() const {
+    double total = 0;
+    for (const uint64_t s : samples_) total += static_cast<double>(s);
+    return total / 1e9;
+  }
+
   double PercentileMicros(double p) const {
     if (samples_.empty()) return 0.0;
     size_t index = static_cast<size_t>(p * static_cast<double>(samples_.size()));
@@ -157,9 +170,12 @@ struct Result {
 };
 
 void PrintHeader() {
-  std::printf("\n%-10s %12s %12s %10s %10s %10s %10s\n", "workload", "ops",
-              "ops/sec", "p50 (us)", "p95 (us)", "p99 (us)", "p99.9 (us)");
-  std::printf("%s\n", std::string(80, '-').c_str());
+  // max matters more than it looks: a handful of multi-millisecond operations
+  // can dominate total run time while leaving every reported percentile small.
+  std::printf("\n%-10s %12s %12s %9s %9s %9s %9s %11s\n", "workload", "ops",
+              "ops/sec", "p50 (us)", "p95 (us)", "p99 (us)", "p99.9 (us)",
+              "max (us)");
+  std::printf("%s\n", std::string(92, '-').c_str());
 }
 
 void PrintResult(Result& result) {
@@ -167,13 +183,22 @@ void PrintResult(Result& result) {
   const double ops_per_sec =
       result.seconds > 0 ? static_cast<double>(result.operations) / result.seconds
                          : 0.0;
-  std::printf("%-10s %12llu %12.0f %10.2f %10.2f %10.2f %10.2f\n",
+  std::printf("%-10s %12llu %12.0f %9.2f %9.2f %9.2f %9.2f %11.1f\n",
               result.name.c_str(),
               static_cast<unsigned long long>(result.operations), ops_per_sec,
               result.latency.PercentileMicros(0.50),
               result.latency.PercentileMicros(0.95),
               result.latency.PercentileMicros(0.99),
-              result.latency.PercentileMicros(0.999));
+              result.latency.PercentileMicros(0.999),
+              result.latency.MaxMicros());
+
+  // If the recorded latencies do not add up to the wall time, the run is
+  // spending time somewhere the percentiles cannot see.
+  const double accounted = result.latency.TotalSeconds();
+  if (result.seconds > 0 && accounted < result.seconds * 0.8) {
+    std::printf("%-10s   note: latencies account for %.1fs of %.1fs wall\n", "",
+                accounted, result.seconds);
+  }
 }
 
 lsm::SyncPolicy ParseSyncPolicy(const std::string& name) {

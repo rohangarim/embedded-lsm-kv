@@ -41,8 +41,10 @@ class BlockCache {
   // Takes ownership of `block` and returns a handle to the cached copy.
   Handle Insert(uint64_t file_number, uint64_t offset, std::string block);
 
-  // Drops every block belonging to a file. Called when a compaction retires an
-  // input file, so its blocks stop occupying capacity that live files need.
+  // Drops every block belonging to a file. O(entries), so it is not on the
+  // compaction commit path -- retired blocks are unreachable by key and age out
+  // through LRU instead. Kept for tests and for callers that need the space
+  // back immediately.
   void EraseFile(uint64_t file_number);
 
   size_t capacity_bytes() const { return capacity_bytes_; }

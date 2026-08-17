@@ -178,11 +178,13 @@ uint64_t DB::OldestLiveLog() const {
   return imm_ != nullptr ? imm_log_number_ : log_number_;
 }
 
-Status DB::WriteManifest(const Version& version, uint64_t log_number) {
+Status DB::WriteManifest(const Version& version, uint64_t log_number,
+                         uint64_t next_file_number,
+                         SequenceNumber last_sequence) {
   std::string body;
   PutFixed64(&body, kManifestMagic);
-  PutFixed64(&body, next_file_number_);
-  PutFixed64(&body, last_sequence_);
+  PutFixed64(&body, next_file_number);
+  PutFixed64(&body, last_sequence);
   PutFixed64(&body, log_number);
 
   uint32_t num_files = 0;
@@ -232,6 +234,31 @@ Status DB::WriteManifest(const Version& version, uint64_t log_number) {
     return PosixError("rename manifest");
   }
   return SyncDirectory(path_);
+}
+
+Status DB::CommitVersion(std::unique_lock<std::mutex>& lock,
+                         std::shared_ptr<const Version> version) {
+  // One commit at a time: two of these racing could write manifests in the
+  // wrong order, or let one commit's cleanup delete files the other just added.
+  while (committing_) bg_cv_.wait(lock);
+  committing_ = true;
+
+  current_ = version;
+  const uint64_t log_number = OldestLiveLog();
+  const uint64_t next_file_number = next_file_number_;
+  const SequenceNumber last_sequence = last_sequence_;
+
+  // Snapshotting these is safe against a writer racing ahead of us: recovery
+  // bumps next_file_number_ past anything it finds on disk, and takes the max
+  // of the manifest sequence and every sequence it replays from the log.
+  lock.unlock();
+  Status s = WriteManifest(*version, log_number, next_file_number, last_sequence);
+  if (s.ok()) RemoveObsoleteFiles(*version, log_number);
+  lock.lock();
+
+  committing_ = false;
+  bg_cv_.notify_all();
+  return s;
 }
 
 Status DB::LoadManifest(uint64_t* log_number) {
@@ -372,7 +399,8 @@ Status DB::Recover() {
   if (!s.ok()) return s;
   log_number_ = new_log;
 
-  s = WriteManifest(*current_, OldestLiveLog());
+  s = WriteManifest(*current_, OldestLiveLog(), next_file_number_,
+                    last_sequence_);
   if (!s.ok()) return s;
 
   RemoveObsoleteFiles(*current_, OldestLiveLog());
@@ -606,11 +634,10 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
 
   auto version = std::make_shared<Version>(*current_);
   version->levels[0].insert(version->levels[0].begin(), meta);  // Newest first.
-  current_ = version;
   imm_ = nullptr;
   imm_log_number_ = 0;
 
-  s = WriteManifest(*version, OldestLiveLog());
+  s = CommitVersion(lock, version);
   if (!s.ok()) {
     bg_error_ = s;
     return s;
@@ -618,7 +645,6 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
   ++stats_.memtable_flushes;
   stats_.flush_output_bytes += meta->file_size;
 
-  RemoveObsoleteFiles(*version, OldestLiveLog());
   bg_cv_.notify_all();
   return Status::OK();
 }
@@ -785,11 +811,11 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
   for (const auto& f : inputs0) removed.insert(f->number);
   for (const auto& f : inputs1) removed.insert(f->number);
 
-  // The inputs are about to stop being reachable; their blocks should not go on
-  // holding cache capacity that the outputs now need.
-  if (block_cache_ != nullptr) {
-    for (const uint64_t number : removed) block_cache_->EraseFile(number);
-  }
+  // Deliberately not evicting the inputs' cached blocks here. Doing so walked
+  // every entry in every shard, holding each shard lock, once per retired file
+  // -- and it ran with the DB lock held, so it stalled every reader. The blocks
+  // are keyed by file number and can never be looked up again, so LRU reclaims
+  // them on its own without anyone waiting.
 
   auto version = std::make_shared<Version>(*current_);
   for (int l : {level, level + 1}) {
@@ -805,9 +831,8 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
   std::sort(target.begin(), target.end(), [](const auto& a, const auto& b) {
     return CompareInternalKey(a->smallest, b->smallest) < 0;
   });
-  current_ = version;
 
-  s = WriteManifest(*version, OldestLiveLog());
+  s = CommitVersion(lock, version);
   if (!s.ok()) {
     bg_error_ = s;
     return s;
@@ -816,7 +841,6 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
   stats_.compaction_input_bytes += input_bytes;
   stats_.compaction_output_bytes += output_bytes;
 
-  RemoveObsoleteFiles(*version, OldestLiveLog());
   bg_cv_.notify_all();
   return Status::OK();
 }

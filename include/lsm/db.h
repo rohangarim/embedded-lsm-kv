@@ -136,7 +136,18 @@ class DB {
   // Returns the level that most needs compaction, or -1.
   int PickCompactionLevel(const Version& version) const;  // Requires mu_.
 
-  Status WriteManifest(const Version& version, uint64_t log_number);  // Requires mu_.
+  // Does filesystem work (fsync, rename, directory fsync) and must NOT be
+  // called with mu_ held -- every reader takes mu_, and an F_FULLFSYNC is
+  // milliseconds. All mutable DB state it needs is passed in explicitly so it
+  // touches nothing that another thread can be writing.
+  Status WriteManifest(const Version& version, uint64_t log_number,
+                       uint64_t next_file_number, SequenceNumber last_sequence);
+
+  // Installs `version` as current, then commits it to the manifest and cleans
+  // up retired files with mu_ released. Requires mu_ held on entry; re-acquires
+  // before returning.
+  Status CommitVersion(std::unique_lock<std::mutex>& lock,
+                       std::shared_ptr<const Version> version);
   Status LoadManifest(uint64_t* log_number);
 
   Status MaybeSyncWal(const WriteOptions& opts);  // Requires mu_.
@@ -182,6 +193,9 @@ class DB {
 
   std::thread bg_thread_;
   bool bg_running_ = false;   // A background pass is in flight.
+  // A version commit is in flight with mu_ released. Serializes commits so two
+  // of them cannot write the manifest out of order.
+  bool committing_ = false;
   bool shutting_down_ = false;
   Status bg_error_;
 

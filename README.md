@@ -161,7 +161,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 93 tests
+ctest --test-dir build --output-on-failure   # 103 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -297,6 +297,44 @@ read), and the read-path counters are atomics, so a `Get` takes the DB mutex onc
 instead of three times. Each was worth a few percent on its own — worth keeping,
 but neither was the bottleneck, and the measurements say so.
 
+### Tail latency, and what hid it
+
+The benchmark originally reported up to p99.9 and no further. That turned out to
+hide the single worst problem in the engine. On a run where workload E averaged
+296 µs per operation, p50 was 20 µs and p99.9 was 310 µs — figures that cannot
+produce that mean. The time was all beyond p99.9, where nothing was looking.
+
+Adding a max column made it obvious: single operations were taking 12–100 ms,
+and workload C — the only workload that performs no writes, and therefore
+triggers no flush or compaction — had a max of 18 µs. Readers were blocking on
+background work.
+
+Two causes, both fixed:
+
+- **The manifest commit ran with the DB lock held.** `WriteManifest` does an
+  `F_FULLFSYNC`, a `rename`, and a directory fsync; `RemoveObsoleteFiles` does an
+  `opendir` and a series of `unlink`s. Every reader takes that same lock. The
+  commit now installs the version under the lock, then releases it and does the
+  filesystem work outside, serialized against other commits by a dedicated flag
+  so two of them cannot write the manifest out of order or let one commit's
+  cleanup delete files the other just added. Everything `WriteManifest` needs is
+  passed in by value, so it touches no state another thread can be writing.
+- **`BlockCache::EraseFile` walked every entry in every shard**, holding each
+  shard lock, once per file a compaction retired — also under the DB lock. It is
+  no longer on that path at all: retired blocks are keyed by file number, can
+  never be looked up again, and age out through LRU without anyone waiting.
+
+Measured back-to-back on the same machine, workload C went from 874 599 to
+1 149 782 ops/sec and D from 828 798 to 1 234 567.
+
+A caveat on the numbers in this section: they were taken on a machine that had
+been running benchmarks continuously for hours, and absolute throughput had
+drifted down roughly 30% for *both* engines by then. The before/after pairs are
+back-to-back on that same state so the comparison holds, but they are not
+comparable to the table above, which was taken on an idle machine. Multi-second
+maxima also persist and are I/O stalls at the OS level rather than lock
+contention — they show up in the `load` workload, which has no readers to block.
+
 ### Why scans are still 0.08x
 
 Workload E is the one remaining large gap, and the cause is understood rather
@@ -332,8 +370,9 @@ in the single-table test — the filter rejects it outright.
 
 These are deliberate, not oversights:
 
-- **The merging iterator is a linear scan over its children**, not a heap. This
-  is the largest remaining gap (scans, above) and is next.
+- **Scan setup costs ~2.4 µs** before a single row is read — an iterator per L0
+  file plus one per level, each seeking a block. At the default 50-row scan that
+  is about a third of the total.
 - **No restart points or prefix compression in data blocks.** Keys are stored
   whole and located by a linear walk from the start of the block. LevelDB's
   restart intervals give both a binary search within the block and a smaller
