@@ -1016,8 +1016,12 @@ class MemTableIteratorAdapter : public Iterator {
 // block out of every file in the level.
 class LevelIterator : public Iterator {
  public:
-  explicit LevelIterator(std::vector<std::shared_ptr<FileMetaData>> files)
-      : files_(std::move(files)) {}
+  // Holds the version rather than a copy of the level's file list. Copying the
+  // vector meant an allocation plus one atomic refcount bump per file on every
+  // scan -- with a couple of dozen files in a level that is most of the cost of
+  // opening an iterator, paid before a single row is read.
+  LevelIterator(std::shared_ptr<const Version> version, int level)
+      : version_(std::move(version)), files_(version_->levels[level]) {}
 
   bool Valid() const override { return iter_ != nullptr && iter_->Valid(); }
 
@@ -1077,7 +1081,8 @@ class LevelIterator : public Iterator {
     }
   }
 
-  std::vector<std::shared_ptr<FileMetaData>> files_;  // Sorted, non-overlapping.
+  std::shared_ptr<const Version> version_;  // Keeps files_ alive.
+  const std::vector<std::shared_ptr<FileMetaData>>& files_;  // Sorted, disjoint.
   size_t index_ = 0;
   std::unique_ptr<Iterator> iter_;
   Status status_;
@@ -1173,7 +1178,7 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& opts) {
   }
   for (int level = 1; level < kNumLevels; ++level) {
     if (version->levels[level].empty()) continue;
-    children.push_back(std::make_unique<LevelIterator>(version->levels[level]));
+    children.push_back(std::make_unique<LevelIterator>(version, level));
   }
   return std::make_unique<DBIter>(NewMergingIterator(std::move(children)), seq,
                                   version);
