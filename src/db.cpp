@@ -407,6 +407,28 @@ Status DB::Recover() {
   return Status::OK();
 }
 
+const Snapshot* DB::GetSnapshot() {
+  std::lock_guard<std::mutex> guard(mu_);
+  auto snapshot = std::unique_ptr<Snapshot>(new Snapshot(last_sequence_));
+  const Snapshot* raw = snapshot.get();
+  snapshots_.emplace(raw, std::move(snapshot));
+  return raw;
+}
+
+void DB::ReleaseSnapshot(const Snapshot* snapshot) {
+  if (snapshot == nullptr) return;
+  std::lock_guard<std::mutex> guard(mu_);
+  snapshots_.erase(snapshot);
+}
+
+SequenceNumber DB::SmallestSnapshot() const {
+  SequenceNumber smallest = last_sequence_;
+  for (const auto& entry : snapshots_) {
+    smallest = std::min(smallest, entry.second->sequence());
+  }
+  return smallest;
+}
+
 // ---------------------------------------------------------------- write path
 
 Status DB::Write(const WriteOptions& opts, ValueType type, std::string_view key,
@@ -530,11 +552,9 @@ Status DB::Get(const ReadOptions& opts, std::string_view key, std::string* value
     mem = mem_;
     imm = imm_;
     version = current_;
-    seq = last_sequence_;
+    seq = opts.snapshot != nullptr ? opts.snapshot->sequence() : last_sequence_;
   }
   stat_gets_.fetch_add(1, std::memory_order_relaxed);
-  (void)opts;
-
   // Newest source first: active memtable, the one being flushed, then L0
   // newest-file-first, then one file per deeper level. The first source that
   // knows about the key is authoritative -- including when what it knows is a
@@ -592,6 +612,7 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
 
   const uint64_t number = next_file_number_++;
   const std::string table_path = TablePath(number);
+  const SequenceNumber smallest_snapshot = SmallestSnapshot();
 
   auto meta = std::make_shared<FileMetaData>();
   meta->number = number;
@@ -620,15 +641,25 @@ Status DB::FlushImmutableMemTable(std::unique_lock<std::mutex>& lock) {
       MemTable::Iterator it(imm.get());
       std::string last_user_key;
       bool have_last_user_key = false;
+      SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
       for (it.SeekToFirst(); it.Valid(); it.Next()) {
         const std::string_view ikey = it.internal_key();
         const std::string_view user_key = ExtractUserKey(ikey);
-        if (have_last_user_key && user_key == last_user_key) {
-          ++versions_dropped;
-          continue;  // Shadowed by a newer version already written.
+        if (!have_last_user_key || user_key != last_user_key) {
+          last_user_key.assign(user_key);
+          have_last_user_key = true;
+          last_sequence_for_key = kMaxSequenceNumber;
         }
-        last_user_key.assign(user_key);
-        have_last_user_key = true;
+        // Drop only once the newer version we already wrote is visible to every
+        // live snapshot. With nothing pinned that is true from the second
+        // version onward, so the collapse stays total in the common case.
+        const bool hidden_from_everyone =
+            last_sequence_for_key <= smallest_snapshot;
+        last_sequence_for_key = ExtractSequence(ikey);
+        if (hidden_from_everyone) {
+          ++versions_dropped;
+          continue;
+        }
         s = builder.Add(ikey, it.value());
         if (!s.ok()) break;
       }
@@ -743,6 +774,8 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
     }
   }
 
+  const SequenceNumber smallest_snapshot = SmallestSnapshot();
+
   uint64_t input_bytes = 0;
   for (const auto& f : inputs0) input_bytes += f->file_size;
   for (const auto& f : inputs1) input_bytes += f->file_size;
@@ -763,6 +796,7 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
   std::shared_ptr<FileMetaData> current_meta;
   std::string last_user_key;
   bool have_last_user_key = false;
+  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   uint64_t output_bytes = 0;
 
   auto finish_output = [&]() -> Status {
@@ -791,15 +825,40 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
     const std::string_view ikey = merged->key();
     const std::string_view user_key = ExtractUserKey(ikey);
 
-    // The merge yields each user key's versions newest-first, so everything
-    // after the first occurrence is shadowed and can be dropped. This is where
-    // an LSM tree actually reclaims the space its overwrites cost.
+    // The merge yields each user key's versions newest-first. A version can go
+    // once a newer one is visible to every live snapshot -- which, with nothing
+    // pinned, means everything after the first occurrence. This is where an LSM
+    // tree actually reclaims the space its overwrites cost.
     const bool is_new_key = !have_last_user_key || user_key != last_user_key;
-    if (!is_new_key) continue;
-    last_user_key.assign(user_key);
-    have_last_user_key = true;
+    if (is_new_key) {
+      last_user_key.assign(user_key);
+      have_last_user_key = true;
+      last_sequence_for_key = kMaxSequenceNumber;
+    }
+    const SequenceNumber seq = ExtractSequence(ikey);
+    const bool hidden_from_everyone = last_sequence_for_key <= smallest_snapshot;
+    last_sequence_for_key = seq;
+    if (hidden_from_everyone) continue;
 
-    if (ExtractValueType(ikey) == ValueType::kDeletion && bottom_most) continue;
+    // A tombstone may only be dropped once nothing below can still hold an
+    // older version, and once no snapshot can still see what it deletes.
+    if (ExtractValueType(ikey) == ValueType::kDeletion && bottom_most &&
+        seq <= smallest_snapshot) {
+      continue;
+    }
+
+    // Cut output files only at a user-key boundary. Splitting one key's
+    // versions across two files at the same level would put that key in two
+    // files of a level that is supposed to be non-overlapping -- and a lookup
+    // probes exactly one file per level, so the versions in the second file
+    // would be unreachable. Unreachable before snapshots existed, because
+    // compaction kept a single version per key and a key could never span
+    // files.
+    if (builder != nullptr && is_new_key &&
+        builder->FileSize() >= options_.target_file_size) {
+      s = finish_output();
+      if (!s.ok()) break;
+    }
 
     if (!builder) {
       lock.lock();
@@ -813,11 +872,6 @@ Status DB::DoCompaction(std::unique_lock<std::mutex>& lock, int level) {
     }
     s = builder->Add(ikey, merged->value());
     if (!s.ok()) break;
-
-    if (builder->FileSize() >= options_.target_file_size) {
-      s = finish_output();
-      if (!s.ok()) break;
-    }
   }
   if (s.ok()) s = merged->status();
   if (s.ok()) s = finish_output();
@@ -1227,7 +1281,6 @@ class DBIter : public Iterator {
 }  // namespace
 
 std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& opts) {
-  (void)opts;
   std::shared_ptr<MemTable> mem, imm;
   std::shared_ptr<const Version> version;
   SequenceNumber seq;
@@ -1236,7 +1289,7 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& opts) {
     mem = mem_;
     imm = imm_;
     version = current_;
-    seq = last_sequence_;
+    seq = opts.snapshot != nullptr ? opts.snapshot->sequence() : last_sequence_;
   }
 
   std::vector<std::unique_ptr<Iterator>> children;

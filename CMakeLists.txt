@@ -95,6 +95,7 @@ if(LSM_BUILD_TESTS)
     tests/test_iterator.cpp
     tests/test_memtable.cpp
     tests/test_wal.cpp
+    tests/test_snapshot.cpp
     tests/test_sstable.cpp
     tests/test_db.cpp
     tests/test_recovery.cpp

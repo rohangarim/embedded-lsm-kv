@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -45,6 +46,23 @@ struct Version {
 
   uint64_t LevelBytes(int level) const;
   size_t NumFiles() const;
+};
+
+// A point in time that reads can be pinned to.
+//
+// Holding one also pins the versions compaction is allowed to discard: an entry
+// may only be dropped once a newer version of the same key is visible to every
+// live snapshot. Long-lived snapshots therefore cost space, which is why they
+// are handed out explicitly and must be released.
+class Snapshot {
+ public:
+  SequenceNumber sequence() const { return sequence_; }
+
+ private:
+  friend class DB;
+  explicit Snapshot(SequenceNumber sequence) : sequence_(sequence) {}
+
+  const SequenceNumber sequence_;
 };
 
 // Observable counters, for benchmarks and for the read/write amplification
@@ -107,6 +125,11 @@ class DB {
   // Forward scan over live user keys. Tombstoned and shadowed versions are
   // filtered out.
   std::unique_ptr<Iterator> NewIterator(const ReadOptions& opts);
+
+  // Pins the current state. Reads passing this in ReadOptions see the database
+  // as of this call, whatever happens afterwards. Must be released.
+  const Snapshot* GetSnapshot();
+  void ReleaseSnapshot(const Snapshot* snapshot);
 
   // Forces the active memtable to disk and waits for it. Test/benchmark hook.
   Status FlushMemTable();
@@ -179,6 +202,13 @@ class DB {
   // Shared by every open table. Held by shared_ptr because a Table outlives the
   // DB whenever a reader is still holding the version that references it.
   std::shared_ptr<BlockCache> block_cache_;
+
+  // Sequence below which no live reader can see anything, so older versions of
+  // a key are safe to discard. Equals the newest sequence when nothing is
+  // pinned, which is what makes the collapse total in the common case.
+  SequenceNumber SmallestSnapshot() const;  // Requires mu_.
+
+  std::map<const Snapshot*, std::unique_ptr<Snapshot>> snapshots_;
 
   // Where the next compaction of each level should start, so successive
   // compactions sweep across the key space instead of rewriting the leftmost

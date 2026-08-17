@@ -80,6 +80,7 @@ recovery an acknowledged write would simply be gone.
 | Data block format | [`include/lsm/block.h`](include/lsm/block.h), [`src/block.cpp`](src/block.cpp) | Prefix compression + restart points |
 | Bloom filter | [`include/lsm/bloom.h`](include/lsm/bloom.h), [`src/bloom.cpp`](src/bloom.cpp) | Configurable bits/key, double hashing |
 | Block cache | [`include/lsm/cache.h`](include/lsm/cache.h), [`src/cache.cpp`](src/cache.cpp) | Sharded LRU over decoded data blocks |
+| Snapshots | [`include/lsm/db.h`](include/lsm/db.h) | Pinned read sequence; gates version collapse |
 | Levels, compaction, recovery | [`include/lsm/db.h`](include/lsm/db.h), [`src/db.cpp`](src/db.cpp) | 7 levels, 10× growth, MVCC on file metadata |
 
 ### Internal keys
@@ -143,6 +144,13 @@ overlap arbitrarily so all of them may need probing; every deeper level is a
 single sorted run, so a binary search picks the at most one file that can hold
 the key.
 
+`GetSnapshot()` pins a sequence number: reads passing it in `ReadOptions` see
+the database as of that call, whatever is written afterwards. It also pins what
+compaction may discard — a version can only be dropped once a newer version of
+the same key is visible to *every* live snapshot. With nothing pinned that is
+true from the second version onward, so the collapse stays total in the common
+case and snapshots cost nothing when unused.
+
 Data blocks go through a sharded LRU cache of already-decoded blocks. Blocks are
 handed out as `shared_ptr`, so a cursor mid-scan keeps its block alive even if
 the cache evicts it underneath — that is what makes eviction safe without any
@@ -180,7 +188,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 122 tests
+ctest --test-dir build --output-on-failure   # 133 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -430,17 +438,37 @@ rule to the flush took skips from 41.2 to 2.1 per row and scans from 19 030 to
 151 313 — and lifted every read workload by 8–19% as a side effect, since point
 lookups had been scanning past those versions too.
 
-Why this is safe without a snapshot API, and what would break it: nothing can be
-pinned to a sequence older than the newest version being kept. Readers that
-already exist hold the memtable itself through a `shared_ptr` and keep reading it
-rather than the new file; any reader created afterwards takes the current
-sequence number, which is at or above every sequence in that memtable. Adding
-snapshots would invalidate that argument — and would invalidate compaction's
-identical rule in exactly the same way.
+That collapse was originally safe only because there was no snapshot API — an
+argument recorded here as a hazard, and since removed by implementing one. Both
+the flush and compaction now drop a version only once a newer one is visible to
+every live snapshot, which reduces to the old behaviour whenever nothing is
+pinned.
 
 The remaining 0.61x is ordinary per-row cost: iterator setup is ~2.4 µs before
 the first row, and each row costs ~85 ns against LevelDB's ~80 ns for the whole
 50-row scan.
+
+### A bug that snapshots exposed
+
+Adding snapshots turned up a latent correctness bug that had been unreachable
+until then.
+
+Compaction cuts an output file once it reaches `target_file_size`, and it was
+doing so wherever it happened to be — including partway through one user key's
+run of versions. That puts two versions of the same key in two different files
+at the same level. Levels below L0 are supposed to be non-overlapping, and a
+point lookup relies on it: it binary-searches to exactly one file per level and
+never looks at a second. So the versions in the second file became unreachable.
+
+It could not happen before, because compaction kept only one version per key and
+a key therefore never spanned files. Snapshots make multi-version runs normal,
+and the bug became reachable immediately — one key in a hundred came back
+`NotFound` through a snapshot that should have seen it.
+
+The fix is to cut output files only at a user-key boundary. Worth noting that
+the failing test was written first and failed for a reason I did not predict:
+the assumption that broke was in the file-splitting code, three steps removed
+from anything the test mentions.
 
 ### Bloom filter false-positive rates
 
@@ -472,9 +500,6 @@ These are deliberate, not oversights:
   comparison is about structure rather than about zlib.
 - **Whole-DB write lock.** One mutex serializes writers. Real engines batch
   concurrent writes into a group commit and take one fsync for the group.
-- **No explicit snapshots.** Reads use the sequence number current at their
-  start, which gives a consistent view, but there is no handle to pin one open
-  across calls.
 - **Manifest is rewritten in full**, rather than appended to as a log of edits.
   Simple and atomic, but O(number of files) per compaction.
 

@@ -5,6 +5,8 @@
 
 namespace lsm {
 
+class Snapshot;
+
 // When the WAL is forced to stable storage. This is the durability vs.
 // throughput knob: kEveryWrite survives a machine power loss, kNever survives
 // only a process crash (the page cache outlives the process), and kInterval
@@ -77,6 +79,11 @@ struct WriteOptions {
 struct ReadOptions {
   bool verify_checksums = true;
   bool fill_cache = true;
+
+  // Read as of this snapshot rather than the latest state. The snapshot must
+  // still be live -- released snapshots dangle, exactly like a freed pointer.
+  // Null reads the newest data.
+  const Snapshot* snapshot = nullptr;
 };
 
 }  // namespace lsm
