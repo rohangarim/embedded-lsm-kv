@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -71,6 +72,11 @@ class Snapshot {
 struct DbStats {
   uint64_t writes = 0;
   uint64_t wal_syncs = 0;
+  // Group commit: how many log appends carried how many writes. writes_grouped
+  // / write_groups is the average group size, and the factor by which fsyncs
+  // were avoided under concurrency.
+  uint64_t write_groups = 0;
+  uint64_t writes_grouped = 0;
   uint64_t memtable_flushes = 0;
   uint64_t compactions = 0;
   // Bytes read into, and written out of, compactions only -- flushes are
@@ -184,6 +190,30 @@ class DB {
   Status CommitVersion(std::unique_lock<std::mutex>& lock,
                        std::shared_ptr<const Version> version);
   Status LoadManifest(uint64_t* log_number);
+
+  // One caller waiting to write. Whoever reaches the front of the queue becomes
+  // the leader: it merges the batches behind it into a single log record, does
+  // one append and at most one fsync for the whole group, and then wakes the
+  // others. Followers do no I/O at all.
+  //
+  // This is what makes fsync-per-write survivable under concurrency -- without
+  // it, N threads pay N fsyncs where one would have done.
+  struct Writer {
+    const WriteBatch* batch = nullptr;
+    bool sync = false;
+    bool done = false;
+    Status status;
+    std::condition_variable cv;
+  };
+
+  // Merges the queued batches, starting at the front, into `merged`. Sets
+  // *last covered writer. Requires mu_.
+  void BuildBatchGroup(Writer** last_writer, WriteBatch* merged);
+
+  // True when this write should be forced to stable storage now. Requires mu_.
+  bool ShouldSyncNow(bool writer_wants_sync) const;
+
+  std::deque<Writer*> writers_;
 
   Status MaybeSyncWal(const WriteOptions& opts);  // Requires mu_.
   void RemoveObsoleteFiles(const Version& live, uint64_t log_number);  // Requires mu_.

@@ -29,6 +29,10 @@ class WriteBatch {
   void Delete(std::string_view key);
   void Clear();
 
+  // Appends every entry of `other`, preserving order. Used by group commit to
+  // fold several callers' batches into one log record.
+  void Append(const WriteBatch& other);
+
   uint32_t Count() const { return count_; }
   bool empty() const { return count_ == 0; }
   // Encoded size, not counting the log record header the WAL adds.

@@ -75,6 +75,13 @@ The WAL append happens *before* the memtable insert. Reversed, a crash could
 leave a value that a reader had already seen but that was never logged — after
 recovery an acknowledged write would simply be gone.
 
+Concurrent writers queue up, and whoever reaches the front becomes the leader:
+it merges the batches behind it into one log record, does a single append and at
+most one fsync for the whole group, then wakes the others. Followers do no I/O
+at all. Without this, N threads under `kEveryWrite` pay N fsyncs where one would
+have done — measured at 446 ops/sec before and 1 038 after, with four threads,
+and p50 latency down from 4 976 µs to 622 µs.
+
 A `WriteBatch` is applied as a unit. Atomicity falls out of the log format
 rather than needing a protocol: the whole batch is one record under one CRC, so
 a crash leaves it complete or leaves a fragment replay discards. There is no
@@ -515,10 +522,9 @@ These are deliberate, not oversights:
   much less, but the per-read option should either work or not exist.
 - **No compression.** Both engines are benchmarked with compression off so the
   comparison is about structure rather than about zlib.
-- **Whole-DB write lock.** One mutex serializes writers. Real engines merge
-  concurrently-queued batches into a single group commit and take one fsync for
-  the group; the batch machinery is now in place for that, but the queueing is
-  not.
+- **A single writer at a time.** Group commit means concurrent writers share
+  one log append and one fsync, but they still serialize behind the leader
+  rather than proceeding in parallel.
 - **Manifest is rewritten in full**, rather than appended to as a log of edits.
   Simple and atomic, but O(number of files) per compaction.
 

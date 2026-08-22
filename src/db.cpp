@@ -431,51 +431,131 @@ SequenceNumber DB::SmallestSnapshot() const {
 
 // ---------------------------------------------------------------- write path
 
+bool DB::ShouldSyncNow(bool writer_wants_sync) const {
+  if (writer_wants_sync) return true;
+  switch (options_.sync_policy) {
+    case SyncPolicy::kEveryWrite:
+      return true;
+    case SyncPolicy::kInterval: {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - last_sync_time_);
+      return static_cast<uint64_t>(elapsed.count()) >= options_.fsync_interval_ms;
+    }
+    case SyncPolicy::kNever:
+      // The bytes are in the page cache. A process crash (or SIGKILL) still
+      // recovers everything, because the kernel owns them. A kernel panic or
+      // power cut loses whatever had not been written back.
+      return false;
+  }
+  return false;
+}
+
+void DB::BuildBatchGroup(Writer** last_writer, WriteBatch* merged) {
+  Writer* first = writers_.front();
+  *last_writer = first;
+  merged->Append(*first->batch);
+
+  // Cap the group so one caller's latency is not held hostage to an unbounded
+  // pile-up behind it. A small leader gets a small group, on the theory that
+  // whoever asked for a tiny write wants it back quickly.
+  size_t budget = 1u << 20;
+  if (merged->ApproximateSize() <= (128u << 10)) {
+    budget = merged->ApproximateSize() + (128u << 10);
+  }
+
+  for (size_t i = 1; i < writers_.size(); ++i) {
+    Writer* w = writers_[i];
+    // Never fold a durability-demanding write into a group that will not sync.
+    // The reverse is fine: a non-sync writer riding along on a synced group
+    // just gets a stronger guarantee than it asked for.
+    if (w->sync && !first->sync) break;
+    if (merged->ApproximateSize() + w->batch->ApproximateSize() > budget) break;
+    merged->Append(*w->batch);
+    *last_writer = w;
+  }
+}
+
 Status DB::Write(const WriteOptions& opts, const WriteBatch& batch) {
   if (batch.empty()) return Status::OK();
 
+  Writer self;
+  self.batch = &batch;
+  self.sync = !opts.use_default_policy && opts.sync;
+
   std::unique_lock<std::mutex> lock(mu_);
-  if (!bg_error_.ok()) return bg_error_;
+  writers_.push_back(&self);
+  // Wait until either somebody else's group covered this write, or we reach
+  // the front and become the leader.
+  while (!self.done && &self != writers_.front()) self.cv.wait(lock);
+  if (self.done) return self.status;
 
-  Status s = MakeRoomForWrite(lock);
-  if (!s.ok()) return s;
+  Status s = bg_error_;
+  if (s.ok()) s = MakeRoomForWrite(lock);
 
-  // The batch occupies a contiguous run of sequence numbers, so a later entry
-  // shadows an earlier one for the same key exactly as two separate writes
-  // would.
-  const SequenceNumber base = last_sequence_ + 1;
-  last_sequence_ += batch.Count();
+  Writer* last_writer = &self;
+  if (s.ok()) {
+    WriteBatch merged;
+    BuildBatchGroup(&last_writer, &merged);
 
-  // WAL first, memtable second. If the order were reversed a crash could leave
-  // a value readable in memory that was never logged -- and after recovery the
-  // acknowledged write would simply be gone.
-  //
-  // The whole batch goes into one log record under one CRC, which is what makes
-  // it atomic: a torn write leaves a fragment that replay discards entirely.
-  s = log_->AddRecord(base, batch);
-  if (!s.ok()) return s;
-  wal_dirty_ = true;
+    // The group occupies one contiguous run of sequence numbers, so ordering
+    // within and between batches is exactly the order callers queued in.
+    const SequenceNumber base = last_sequence_ + 1;
+    last_sequence_ += merged.Count();
+    const bool sync = ShouldSyncNow(self.sync);
 
-  // A failed fsync must not be swallowed: the caller would take an OK as a
-  // durability guarantee the device never gave us.
-  s = MaybeSyncWal(opts);
-  if (!s.ok()) return s;
+    // Everything below is safe with the lock released: only the leader runs at
+    // a time, so log_ and mem_ have no other writer. Readers touch mem_
+    // concurrently, which the skip list is built for.
+    lock.unlock();
+    s = log_->AddRecord(base, merged);
+    if (s.ok() && sync) s = log_->Sync();
 
-  SequenceNumber seq = base;
-  uint64_t user_bytes = 0;
-  s = batch.ForEach(
-      [&](ValueType type, std::string_view key, std::string_view value) {
-        mem_->Add(seq++, type, key, value);
-        user_bytes += key.size() + value.size();
-      });
-  if (!s.ok()) return s;
+    uint64_t user_bytes = 0;
+    if (s.ok()) {
+      SequenceNumber seq = base;
+      s = merged.ForEach(
+          [&](ValueType type, std::string_view key, std::string_view value) {
+            mem_->Add(seq++, type, key, value);
+            user_bytes += key.size() + value.size();
+          });
+    }
+    lock.lock();
 
-  // Record overhead: an 8-byte record header (crc + length), a 12-byte batch
-  // header, and per entry a type byte plus two varint lengths.
-  stats_.bytes_written_to_wal += user_bytes + 20 + batch.Count() * 5;
-  stats_.user_bytes_written += user_bytes;
-  stats_.writes += batch.Count();
-  return Status::OK();
+    if (s.ok()) {
+      if (sync) {
+        ++stats_.wal_syncs;
+        wal_dirty_ = false;
+        last_sync_time_ = std::chrono::steady_clock::now();
+      } else {
+        wal_dirty_ = true;
+      }
+      // Record overhead: an 8-byte record header (crc + length), a 12-byte
+      // batch header, and per entry a type byte plus two varint lengths.
+      stats_.bytes_written_to_wal += user_bytes + 20 + merged.Count() * 5;
+      stats_.user_bytes_written += user_bytes;
+      stats_.writes += merged.Count();
+      stats_.write_groups += 1;
+      stats_.writes_grouped += merged.Count();
+    } else {
+      bg_error_ = s;
+    }
+  }
+
+  // Retire everyone this group covered, then hand leadership to whoever is
+  // still queued.
+  while (true) {
+    Writer* ready = writers_.front();
+    writers_.pop_front();
+    if (ready != &self) {
+      ready->status = s;
+      ready->done = true;
+      ready->cv.notify_one();
+    }
+    if (ready == last_writer) break;
+  }
+  if (!writers_.empty()) writers_.front()->cv.notify_one();
+
+  return s;
 }
 
 Status DB::MaybeSyncWal(const WriteOptions& opts) {

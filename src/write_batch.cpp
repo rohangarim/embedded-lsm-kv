@@ -24,6 +24,11 @@ void WriteBatch::Delete(std::string_view key) {
   ++count_;
 }
 
+void WriteBatch::Append(const WriteBatch& other) {
+  rep_.append(other.rep_);
+  count_ += other.count_;
+}
+
 void WriteBatch::Clear() {
   rep_.clear();
   count_ = 0;

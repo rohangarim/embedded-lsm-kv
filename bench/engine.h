@@ -102,6 +102,7 @@ class LsmEngine : public Engine {
         buf, sizeof(buf),
         "  writes                 %llu\n"
         "  wal fsyncs             %llu\n"
+        "  write groups           %llu (%.2f writes per group)\n"
         "  memtable flushes       %llu\n"
         "  compactions            %llu\n"
         "  compaction in / out    %.1f MiB / %.1f MiB\n"
@@ -117,6 +118,11 @@ class LsmEngine : public Engine {
         "  scan entries skipped   %llu (%.1f per row returned)\n"
         "\nlevel shape\n%s",
         (unsigned long long)stats.writes, (unsigned long long)stats.wal_syncs,
+        (unsigned long long)stats.write_groups,
+        stats.write_groups == 0
+            ? 0.0
+            : static_cast<double>(stats.writes_grouped) /
+                  static_cast<double>(stats.write_groups),
         (unsigned long long)stats.memtable_flushes,
         (unsigned long long)stats.compactions,
         stats.compaction_input_bytes / 1048576.0,
