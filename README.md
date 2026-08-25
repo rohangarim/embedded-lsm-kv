@@ -483,9 +483,43 @@ the flush and compaction now drop a version only once a newer one is visible to
 every live snapshot, which reduces to the old behaviour whenever nothing is
 pinned.
 
-The remaining 0.61x is ordinary per-row cost: iterator setup is ~2.4 µs before
-the first row, and each row costs ~85 ns against LevelDB's ~80 ns for the whole
-50-row scan.
+### Where scan time actually goes
+
+The remaining gap got profiled rather than guessed at, and the guess was wrong.
+"Iterator setup" had been written down here as ~2.4 µs of construction overhead
+— roughly ten heap allocations for the cursor tree. Timing the phases separately
+put construction at **0.25 µs**. Essentially all of it is the `Seek`, which has
+to position a cursor in every level.
+
+Two follow-up hypotheses also died. Sweeping the block restart interval across
+4 / 8 / 16 / 32 moved seek time by less than noise (5.55 / 5.44 / 5.37 / 5.59 µs),
+so decoding entries inside a block was not it either. Giving the cache 256 MiB so
+the whole database fits cut block reads 14x but seek only 13%, so it was not I/O.
+
+What it is depends entirely on access pattern:
+
+| Access pattern | Cache hit rate | Seek |
+|---|---:|---:|
+| uniform over 48 MiB, 8 MiB cache | 35% | 5.20 µs |
+| uniform, 256 MiB cache | 84% | 4.51 µs |
+| skewed to a hot 3 000 keys, 8 MiB cache | 88% | 1.71 µs |
+
+The middle row is the interesting one: nearly everything is cached and it is
+*still* slow, while the bottom row is three times faster at a similar hit rate.
+The difference is CPU cache, not disk. Under uniform access the block index is
+cold, and it was a `vector` of entries each holding a `std::string` — an internal
+key is ~28 bytes, past libc++'s small-string threshold, so every binary-search
+step chased a pointer into a separate heap allocation. Packing the keys
+end-to-end into one buffer and making the entries POD took that case from 4.51 to
+3.69 µs.
+
+The honest outcome: that helps cold, uniformly-accessed indexes and does nothing
+for the benchmark, whose Zipfian workload keeps the index hot. Workload E
+measured 150 267 ops/sec afterwards against 151 313 before — unchanged. Dropping
+a per-row copy of the value (`DBIter` now hands out a view into the block rather
+than copying ~100 bytes) took per-row cost from 99 to 93 ns, which is real but
+small. Both changes are strictly less work than before, so they stay; neither is
+the answer to scans.
 
 ### A bug that snapshots exposed
 
@@ -528,10 +562,10 @@ in the single-table test — the filter rejects it outright.
 
 These are deliberate, not oversights:
 
-- **Scan setup costs ~2.4 µs** before a single row is read — an iterator per L0
-  file plus one per level, each seeking a block, and roughly ten heap
-  allocations. At the default 50-row scan that is about a third of the total,
-  and it is the largest remaining scan cost.
+- **Scans stay ~0.6x of LevelDB** and profiling did not find a single cause —
+  see "Where scan time actually goes" above. Positioning across every level is
+  inherent to a range scan; closing the rest needs the per-level work itself to
+  get cheaper, not another micro-optimisation.
 - **`ReadOptions::verify_checksums` is ignored.** Verification is controlled by
   the database-wide `Options` only. Now that verification is cheap this matters
   much less, but the per-read option should either work or not exist.

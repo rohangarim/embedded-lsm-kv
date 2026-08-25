@@ -241,13 +241,13 @@ Status Table::Open(const std::string& path, const Options& options,
   // block cache precisely because they are already retained here; caching them
   // would just take capacity away from data blocks.
   BlockCache::Handle bloom_contents;
-  s = table->ReadBlock(IndexEntry{"", bloom_offset, bloom_size}, &bloom_contents,
+  s = table->ReadBlock(bloom_offset, bloom_size, &bloom_contents,
                        /*cacheable=*/false);
   if (!s.ok()) return s;
   table->bloom_ = BloomFilter(*bloom_contents);
 
   BlockCache::Handle index_contents;
-  s = table->ReadBlock(IndexEntry{"", index_offset, index_size}, &index_contents,
+  s = table->ReadBlock(index_offset, index_size, &index_contents,
                        /*cacheable=*/false);
   if (!s.ok()) return s;
 
@@ -258,11 +258,13 @@ Status Table::Open(const std::string& path, const Options& options,
       return Status::Corruption(path + ": malformed index block");
     }
     IndexEntry entry;
-    entry.last_key.assign(last_key);
+    entry.key_offset = static_cast<uint32_t>(table->index_keys_.size());
+    entry.key_length = static_cast<uint32_t>(last_key.size());
+    table->index_keys_.append(last_key.data(), last_key.size());
     entry.offset = DecodeFixed64(rest.data());
     entry.size = DecodeFixed64(rest.data() + 8);
     rest.remove_prefix(16);
-    table->index_.push_back(std::move(entry));
+    table->index_.push_back(entry);
   }
 
   // Reads of data blocks are counted; the index and bloom loads above are not
@@ -289,11 +291,11 @@ uint64_t Table::block_cache_hits() const {
   return stats_->cache_hits.load(std::memory_order_relaxed);
 }
 
-Status Table::ReadBlock(const IndexEntry& entry, BlockCache::Handle* out,
+Status Table::ReadBlock(uint64_t offset, uint64_t size, BlockCache::Handle* out,
                         bool cacheable) const {
   const bool use_cache = cacheable && cache_ != nullptr;
   if (use_cache) {
-    if (BlockCache::Handle cached = cache_->Lookup(file_number_, entry.offset)) {
+    if (BlockCache::Handle cached = cache_->Lookup(file_number_, offset)) {
       stats_->cache_hits.fetch_add(1, std::memory_order_relaxed);
       *out = std::move(cached);
       return Status::OK();
@@ -301,19 +303,18 @@ Status Table::ReadBlock(const IndexEntry& entry, BlockCache::Handle* out,
   }
 
   std::string buf;
-  const Status s =
-      ReadFullyAt(fd_, entry.offset, entry.size + kBlockTrailerSize, &buf);
+  const Status s = ReadFullyAt(fd_, offset, size + kBlockTrailerSize, &buf);
   if (!s.ok()) return s;
 
-  const uint32_t stored = DecodeFixed32(buf.data() + entry.size);
-  if (verify_checksums_ && crc32c::Value(buf.data(), entry.size) != stored) {
+  const uint32_t stored = DecodeFixed32(buf.data() + size);
+  if (verify_checksums_ && crc32c::Value(buf.data(), size) != stored) {
     return Status::Corruption(path_ + ": block checksum mismatch");
   }
-  buf.resize(entry.size);
+  buf.resize(size);
   stats_->blocks_read.fetch_add(1, std::memory_order_relaxed);
 
   if (use_cache) {
-    *out = cache_->Insert(file_number_, entry.offset, std::move(buf));
+    *out = cache_->Insert(file_number_, offset, std::move(buf));
   } else {
     *out = std::make_shared<const std::string>(std::move(buf));
   }
@@ -337,7 +338,7 @@ bool Table::Get(std::string_view key, SequenceNumber seq, std::string* value,
   size_t lo = 0, hi = index_.size();
   while (lo < hi) {
     const size_t mid = lo + (hi - lo) / 2;
-    if (CompareInternalKey(index_[mid].last_key, target) < 0) {
+    if (CompareInternalKey(IndexKey(mid), target) < 0) {
       lo = mid + 1;
     } else {
       hi = mid;
@@ -346,7 +347,7 @@ bool Table::Get(std::string_view key, SequenceNumber seq, std::string* value,
   if (lo >= index_.size()) return false;  // Past the end of the table.
 
   BlockCache::Handle contents;
-  const Status s = ReadBlock(index_[lo], &contents);
+  const Status s = ReadBlock(index_[lo].offset, index_[lo].size, &contents);
   if (!s.ok()) {
     *status = s;
     return true;  // Surface the I/O error rather than silently reading past it.
@@ -393,11 +394,10 @@ class TableIterator : public Iterator {
   }
 
   void Seek(std::string_view target) override {
-    const auto& index = table_->index_;
-    size_t lo = 0, hi = index.size();
+    size_t lo = 0, hi = table_->index_.size();
     while (lo < hi) {
       const size_t mid = lo + (hi - lo) / 2;
-      if (CompareInternalKey(index[mid].last_key, target) < 0) {
+      if (CompareInternalKey(table_->IndexKey(mid), target) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -429,7 +429,8 @@ class TableIterator : public Iterator {
   // `target` (or the block's first entry when target is null).
   void LoadBlock(const std::string_view* target) {
     while (block_index_ < table_->index_.size()) {
-      status_ = table_->ReadBlock(table_->index_[block_index_], &block_);
+      status_ = table_->ReadBlock(table_->index_[block_index_].offset,
+                                  table_->index_[block_index_].size, &block_);
       if (!status_.ok()) {
         valid_ = false;
         return;

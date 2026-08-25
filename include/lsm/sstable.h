@@ -144,11 +144,25 @@ class Table {
  private:
   friend class TableIterator;
 
+  // Deliberately a POD with the key held out of line, rather than an inline
+  // std::string. A block index runs to thousands of entries and every lookup
+  // binary-searches it, so each comparison used to chase a pointer into a
+  // separate heap allocation -- an internal key is ~28 bytes, past libc++'s
+  // small-string threshold. That is a likely cache miss per comparison, ten
+  // comparisons per file, several files per seek. Keys now live end to end in
+  // one buffer and the entries themselves pack densely.
   struct IndexEntry {
-    std::string last_key;  // Largest internal key in the block.
+    uint32_t key_offset;  // Into index_keys_.
+    uint32_t key_length;
     uint64_t offset;
     uint64_t size;  // Contents size, excluding the CRC trailer.
   };
+
+  // Largest internal key in block `i`.
+  std::string_view IndexKey(size_t i) const {
+    return std::string_view(index_keys_.data() + index_[i].key_offset,
+                            index_[i].key_length);
+  }
 
   Table() = default;
 
@@ -156,7 +170,7 @@ class Table {
   // duplicated, and stays alive for as long as the caller holds the handle.
   // `cacheable` is false for the index and bloom blocks, which are read once at
   // open and retained for the life of the table anyway.
-  Status ReadBlock(const IndexEntry& entry, BlockCache::Handle* out,
+  Status ReadBlock(uint64_t offset, uint64_t size, BlockCache::Handle* out,
                    bool cacheable = true) const;
 
   std::string path_;
@@ -166,6 +180,7 @@ class Table {
   std::shared_ptr<BlockCache> cache_;
   uint64_t file_number_ = 0;
   std::vector<IndexEntry> index_;
+  std::string index_keys_;  // Every index key, concatenated.
   BloomFilter bloom_;
 
   struct Stats;

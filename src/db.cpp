@@ -1530,8 +1530,11 @@ class DBIter : public Iterator {
         SkipRestOfCurrentKey();
         continue;
       }
-      const std::string_view v = inner_->value();
-      value_.assign(v.data(), v.size());
+      // A view, not a copy. The bytes live in whichever child is currently
+      // smallest -- a cached block or the memtable arena -- and stay valid
+      // until the next Next(), which is exactly the lifetime the Iterator
+      // contract promises. Copying them cost a ~100-byte memcpy per row.
+      value_ = inner_->value();
       valid_ = true;
       ++returned_count_;
       return;
@@ -1548,8 +1551,11 @@ class DBIter : public Iterator {
   // hit a shared atomic on every row.
   uint64_t returned_count_ = 0;
   uint64_t skipped_count_ = 0;
+  // key_ stays an owned copy: SkipRestOfCurrentKey compares against it while
+  // advancing inner_, so a view would be looking at bytes that moved. At ~20
+  // bytes it fits in the small-string buffer and costs no allocation.
   std::string key_;
-  std::string value_;
+  std::string_view value_;
   bool valid_ = false;
 };
 
