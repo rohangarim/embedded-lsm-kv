@@ -203,16 +203,31 @@ the first such record as the end of the log. That is correct because a torn
 record is by construction the one that was still being written, and was never
 acknowledged.
 
-The manifest is the commit point. It is written to a temp file, fsynced, and
-`rename()`d — atomic, so a crash leaves either the old file list or the new one,
-never a half-written one. SSTables are fsynced before the manifest is allowed to
+The manifest is the commit point, and it is an append-only log of edits rather
+than a file list. A commit records what changed — usually two or three files —
+as one record under one CRC, and costs a single append plus a single fsync. It
+used to rewrite the entire file list every time: two fsyncs, a rename and a
+directory fsync, all proportional to the size of the database rather than the
+size of the change. Measured at 114 bytes per commit with 20 files live and 117
+with 322, which is the flat curve the design is for.
+
+Recovery replays the edits in order. A crash partway through an append leaves a
+record that fails its CRC; recovery drops it and opens on the last complete one,
+so the commit simply never happened. The ordering that makes this safe is that
+the record is fsynced *before* the cleanup it authorises runs — a durable record
+always precedes the deletion of the files it retires.
+
+The log is collapsed back into a single snapshot record when it grows past
+`manifest_rewrite_bytes`, and at every open. That rewrite goes through a temp
+file and a `rename()`, which is atomic, so a crash during it leaves the old
+manifest intact. SSTables are fsynced before the manifest is allowed to
 reference them, and the directory is fsynced after the rename (a rename is not
 durable until the *directory* entry is).
 
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 150 tests
+ctest --test-dir build --output-on-failure   # 158 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```
@@ -525,8 +540,6 @@ These are deliberate, not oversights:
 - **A single writer at a time.** Group commit means concurrent writers share
   one log append and one fsync, but they still serialize behind the leader
   rather than proceeding in parallel.
-- **Manifest is rewritten in full**, rather than appended to as a log of edits.
-  Simple and atomic, but O(number of files) per compaction.
 
 ## Design questions
 

@@ -77,6 +77,13 @@ struct DbStats {
   // were avoided under concurrency.
   uint64_t write_groups = 0;
   uint64_t writes_grouped = 0;
+  // Manifest cost. Bytes here are metadata written per commit; before the
+  // manifest became an append-only edit log this was the whole file list every
+  // time, so it grew with the size of the database rather than the size of the
+  // change.
+  uint64_t manifest_bytes_written = 0;
+  uint64_t manifest_commits = 0;
+  uint64_t manifest_rewrites = 0;
   uint64_t memtable_flushes = 0;
   uint64_t compactions = 0;
   // Bytes read into, and written out of, compactions only -- flushes are
@@ -177,12 +184,42 @@ class DB {
   // Returns the level that most needs compaction, or -1.
   int PickCompactionLevel(const Version& version) const;  // Requires mu_.
 
-  // Does filesystem work (fsync, rename, directory fsync) and must NOT be
-  // called with mu_ held -- every reader takes mu_, and an F_FULLFSYNC is
+  // The set of files one commit adds and removes. Recording the difference
+  // rather than the whole file list is what lets a commit be a single append.
+  struct VersionEdit {
+    struct AddedFile {
+      int level;
+      std::shared_ptr<FileMetaData> file;
+    };
+    struct DeletedFile {
+      int level;
+      uint64_t number;
+    };
+    std::vector<AddedFile> added;
+    std::vector<DeletedFile> deleted;
+  };
+
+  static VersionEdit ComputeEdit(const Version& from, const Version& to);
+
+  // Encodes one manifest record. A snapshot record carries the entire file set
+  // and tells a reader to discard whatever it had; an edit carries only the
+  // difference.
+  static std::string EncodeManifestRecord(bool snapshot, const VersionEdit& edit,
+                                          uint64_t log_number,
+                                          uint64_t next_file_number,
+                                          SequenceNumber last_sequence);
+
+  // Appends one record to the open manifest and fsyncs it. Must NOT be called
+  // with mu_ held -- every reader takes mu_, and an F_FULLFSYNC is
   // milliseconds. All mutable DB state it needs is passed in explicitly so it
-  // touches nothing that another thread can be writing.
-  Status WriteManifest(const Version& version, uint64_t log_number,
-                       uint64_t next_file_number, SequenceNumber last_sequence);
+  // touches nothing another thread can be writing.
+  Status AppendManifestRecord(const std::string& record);
+
+  // Rewrites the manifest as a single snapshot record and swaps it in
+  // atomically. Only run when the log of edits has grown large enough to be
+  // worth collapsing, so the common commit stays one append.
+  Status RewriteManifest(const Version& version, uint64_t log_number,
+                         uint64_t next_file_number, SequenceNumber last_sequence);
 
   // Installs `version` as current, then commits it to the manifest and cleans
   // up retired files with mu_ released. Requires mu_ held on entry; re-acquires
@@ -214,6 +251,9 @@ class DB {
   bool ShouldSyncNow(bool writer_wants_sync) const;
 
   std::deque<Writer*> writers_;
+
+  int manifest_fd_ = -1;
+  uint64_t manifest_size_ = 0;
 
   Status MaybeSyncWal(const WriteOptions& opts);  // Requires mu_.
   void RemoveObsoleteFiles(const Version& live, uint64_t log_number);  // Requires mu_.

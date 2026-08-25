@@ -94,6 +94,7 @@ if(LSM_BUILD_TESTS)
     tests/test_crc32c.cpp
     tests/test_skiplist.cpp
     tests/test_iterator.cpp
+    tests/test_manifest.cpp
     tests/test_memtable.cpp
     tests/test_wal.cpp
     tests/test_write_batch.cpp

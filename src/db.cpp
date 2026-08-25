@@ -18,9 +18,6 @@
 namespace lsm {
 namespace {
 
-// "MANIFEST" in ASCII, little-endian.
-constexpr uint64_t kManifestMagic = 0x54534546494e414dull;
-
 Status PosixError(const std::string& what) {
   return Status::IOError(what + ": " + std::strerror(errno));
 }
@@ -131,6 +128,10 @@ DB::~DB() {
 
   std::unique_lock<std::mutex> lock(mu_);
   if (log_) log_->Close();
+  if (manifest_fd_ >= 0) {
+    ::close(manifest_fd_);
+    manifest_fd_ = -1;
+  }
 }
 
 std::string DB::TablePath(uint64_t number) const {
@@ -178,37 +179,112 @@ uint64_t DB::OldestLiveLog() const {
   return imm_ != nullptr ? imm_log_number_ : log_number_;
 }
 
-Status DB::WriteManifest(const Version& version, uint64_t log_number,
-                         uint64_t next_file_number,
-                         SequenceNumber last_sequence) {
-  std::string body;
-  PutFixed64(&body, kManifestMagic);
-  PutFixed64(&body, next_file_number);
-  PutFixed64(&body, last_sequence);
-  PutFixed64(&body, log_number);
+// Manifest record framing, same shape as the WAL: a file header, then
+// [crc32c][length][payload] records. A commit appends one record and fsyncs it.
+// The previous design rewrote the entire file list on every flush and
+// compaction -- two fsyncs, a rename and a directory fsync, all proportional to
+// the number of files in the database, for a change that usually touches three
+// of them.
+namespace {
+constexpr char kManifestFileMagic[7] = {'L', 'S', 'M', 'M', 'F', 'T', '\0'};
+constexpr char kManifestFormatVersion = 2;
+constexpr size_t kManifestFileHeaderSize = 8;
+constexpr size_t kManifestRecordHeaderSize = 8;
+constexpr uint8_t kRecordSnapshot = 0;
+constexpr uint8_t kRecordEdit = 1;
+}  // namespace
 
-  uint32_t num_files = 0;
-  for (const auto& level : version.levels) num_files += level.size();
-  PutFixed32(&body, num_files);
-
+DB::VersionEdit DB::ComputeEdit(const Version& from, const Version& to) {
+  VersionEdit edit;
   for (int level = 0; level < kNumLevels; ++level) {
-    for (const auto& f : version.levels[level]) {
-      PutFixed32(&body, static_cast<uint32_t>(level));
-      PutFixed64(&body, f->number);
-      PutFixed64(&body, f->file_size);
-      PutLengthPrefixed(&body, f->smallest);
-      PutLengthPrefixed(&body, f->largest);
+    std::set<uint64_t> before, after;
+    for (const auto& f : from.levels[level]) before.insert(f->number);
+    for (const auto& f : to.levels[level]) after.insert(f->number);
+
+    for (const auto& f : to.levels[level]) {
+      if (before.count(f->number) == 0) edit.added.push_back({level, f});
+    }
+    for (const auto& f : from.levels[level]) {
+      if (after.count(f->number) == 0) {
+        edit.deleted.push_back({level, f->number});
+      }
     }
   }
-  PutFixed32(&body, crc32c::Value(body.data(), body.size()));
+  return edit;
+}
 
-  // Write-to-temp then rename: rename() is atomic, so a crash leaves either the
-  // old manifest or the new one, never a half-written list of live files. This
-  // is the commit point of a flush or compaction -- the SSTables are already on
-  // disk and fsynced before we get here.
+std::string DB::EncodeManifestRecord(bool snapshot, const VersionEdit& edit,
+                                     uint64_t log_number,
+                                     uint64_t next_file_number,
+                                     SequenceNumber last_sequence) {
+  std::string payload;
+  payload.push_back(static_cast<char>(snapshot ? kRecordSnapshot : kRecordEdit));
+  PutFixed64(&payload, next_file_number);
+  PutFixed64(&payload, last_sequence);
+  PutFixed64(&payload, log_number);
+
+  PutFixed32(&payload, static_cast<uint32_t>(edit.added.size()));
+  for (const auto& a : edit.added) {
+    PutFixed32(&payload, static_cast<uint32_t>(a.level));
+    PutFixed64(&payload, a.file->number);
+    PutFixed64(&payload, a.file->file_size);
+    PutLengthPrefixed(&payload, a.file->smallest);
+    PutLengthPrefixed(&payload, a.file->largest);
+  }
+  PutFixed32(&payload, static_cast<uint32_t>(edit.deleted.size()));
+  for (const auto& d : edit.deleted) {
+    PutFixed32(&payload, static_cast<uint32_t>(d.level));
+    PutFixed64(&payload, d.number);
+  }
+
+  std::string record;
+  PutFixed32(&record, crc32c::Value(payload.data(), payload.size()));
+  PutFixed32(&record, static_cast<uint32_t>(payload.size()));
+  record.append(payload);
+  return record;
+}
+
+Status DB::AppendManifestRecord(const std::string& record) {
+  if (manifest_fd_ < 0) return Status::InvalidArgument("manifest not open");
+
+  size_t written = 0;
+  while (written < record.size()) {
+    const ssize_t n =
+        ::write(manifest_fd_, record.data() + written, record.size() - written);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      return PosixError("append manifest");
+    }
+    written += static_cast<size_t>(n);
+  }
+  // One fsync, and no rename: the record is either wholly present and passes
+  // its CRC, or it is a torn tail that recovery discards along with the commit
+  // it represented.
+  const Status s = SyncFd(manifest_fd_, "manifest");
+  if (!s.ok()) return s;
+  manifest_size_ += record.size();
+  stats_.manifest_bytes_written += record.size();
+  ++stats_.manifest_commits;
+  return Status::OK();
+}
+
+Status DB::RewriteManifest(const Version& version, uint64_t log_number,
+                           uint64_t next_file_number,
+                           SequenceNumber last_sequence) {
+  VersionEdit whole;
+  for (int level = 0; level < kNumLevels; ++level) {
+    for (const auto& f : version.levels[level]) whole.added.push_back({level, f});
+  }
+  const std::string record = EncodeManifestRecord(
+      /*snapshot=*/true, whole, log_number, next_file_number, last_sequence);
+
   const std::string tmp = ManifestPath() + ".tmp";
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) return PosixError("open " + tmp);
+
+  std::string body(kManifestFileMagic, sizeof(kManifestFileMagic));
+  body.push_back(kManifestFormatVersion);
+  body.append(record);
 
   size_t written = 0;
   while (written < body.size()) {
@@ -230,10 +306,22 @@ Status DB::WriteManifest(const Version& version, uint64_t log_number,
   }
   ::close(fd);
 
+  // Write-to-temp then rename: rename() is atomic, so a crash leaves either the
+  // old manifest or the new one, never a half-written list of live files.
   if (::rename(tmp.c_str(), ManifestPath().c_str()) != 0) {
     return PosixError("rename manifest");
   }
-  return SyncDirectory(path_);
+  const Status s = SyncDirectory(path_);
+  if (!s.ok()) return s;
+
+  if (manifest_fd_ >= 0) ::close(manifest_fd_);
+  manifest_fd_ = ::open(ManifestPath().c_str(), O_WRONLY | O_APPEND);
+  if (manifest_fd_ < 0) return PosixError("reopen manifest");
+  manifest_size_ = body.size();
+  stats_.manifest_bytes_written += body.size();
+  ++stats_.manifest_commits;
+  ++stats_.manifest_rewrites;
+  return Status::OK();
 }
 
 Status DB::CommitVersion(std::unique_lock<std::mutex>& lock,
@@ -243,16 +331,29 @@ Status DB::CommitVersion(std::unique_lock<std::mutex>& lock,
   while (committing_) bg_cv_.wait(lock);
   committing_ = true;
 
+  auto previous = current_;
   current_ = version;
   const uint64_t log_number = OldestLiveLog();
   const uint64_t next_file_number = next_file_number_;
   const SequenceNumber last_sequence = last_sequence_;
+  const bool rewrite = manifest_size_ >= options_.manifest_rewrite_bytes;
+
+  const VersionEdit edit = ComputeEdit(*previous, *version);
+  const std::string record = EncodeManifestRecord(
+      /*snapshot=*/false, edit, log_number, next_file_number, last_sequence);
 
   // Snapshotting these is safe against a writer racing ahead of us: recovery
   // bumps next_file_number_ past anything it finds on disk, and takes the max
   // of the manifest sequence and every sequence it replays from the log.
   lock.unlock();
-  Status s = WriteManifest(*version, log_number, next_file_number, last_sequence);
+  Status s;
+  if (rewrite) {
+    // Collapse the accumulated edits back into a single snapshot. Rare by
+    // construction, so the common commit stays one append and one fsync.
+    s = RewriteManifest(*version, log_number, next_file_number, last_sequence);
+  } else {
+    s = AppendManifestRecord(record);
+  }
   if (s.ok()) RemoveObsoleteFiles(*version, log_number);
   lock.lock();
 
@@ -263,71 +364,133 @@ Status DB::CommitVersion(std::unique_lock<std::mutex>& lock,
 
 Status DB::LoadManifest(uint64_t* log_number) {
   *log_number = 0;
-  const int fd = ::open(ManifestPath().c_str(), O_RDONLY);
-  if (fd < 0) {
-    if (errno == ENOENT) {
-      // Fresh database.
-      current_ = std::make_shared<Version>();
-      return Status::OK();
+
+  std::string buf;
+  {
+    const int fd = ::open(ManifestPath().c_str(), O_RDONLY);
+    if (fd < 0) {
+      if (errno == ENOENT) {
+        current_ = std::make_shared<Version>();  // Fresh database.
+        return Status::OK();
+      }
+      return PosixError("open manifest");
     }
-    return PosixError("open manifest");
-  }
-
-  std::string body;
-  char chunk[1 << 16];
-  while (true) {
-    const ssize_t n = ::read(fd, chunk, sizeof(chunk));
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      const Status s = PosixError("read manifest");
-      ::close(fd);
-      return s;
+    char chunk[1 << 16];
+    while (true) {
+      const ssize_t n = ::read(fd, chunk, sizeof(chunk));
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        const Status s = PosixError("read manifest");
+        ::close(fd);
+        return s;
+      }
+      if (n == 0) break;
+      buf.append(chunk, static_cast<size_t>(n));
     }
-    if (n == 0) break;
-    body.append(chunk, static_cast<size_t>(n));
-  }
-  ::close(fd);
-
-  if (body.size() < 36) return Status::Corruption("manifest too short");
-  const size_t body_len = body.size() - 4;
-  if (crc32c::Value(body.data(), body_len) != DecodeFixed32(body.data() + body_len)) {
-    return Status::Corruption("manifest checksum mismatch");
+    ::close(fd);
   }
 
-  std::string_view rest(body.data(), body_len);
-  if (DecodeFixed64(rest.data()) != kManifestMagic) {
+  if (buf.size() < kManifestFileHeaderSize) {
+    return Status::Corruption("manifest shorter than its header");
+  }
+  if (std::memcmp(buf.data(), kManifestFileMagic, sizeof(kManifestFileMagic)) != 0) {
     return Status::Corruption("bad manifest magic");
   }
-  next_file_number_ = DecodeFixed64(rest.data() + 8);
-  last_sequence_ = DecodeFixed64(rest.data() + 16);
-  *log_number = DecodeFixed64(rest.data() + 24);
-  const uint32_t num_files = DecodeFixed32(rest.data() + 32);
-  rest.remove_prefix(36);
+  if (buf[sizeof(kManifestFileMagic)] != kManifestFormatVersion) {
+    return Status::Corruption("unsupported manifest format version");
+  }
+
+  // Rebuild the file set by replaying records in order. Metadata is collected
+  // first and the SSTables opened afterwards, so a file that some later edit
+  // removes is never opened at all.
+  struct Entry {
+    int level;
+    uint64_t number;
+    uint64_t file_size;
+    std::string smallest;
+    std::string largest;
+  };
+  std::map<uint64_t, Entry> live;
+
+  size_t offset = kManifestFileHeaderSize;
+  size_t records = 0;
+  while (offset < buf.size()) {
+    if (buf.size() - offset < kManifestRecordHeaderSize) break;  // Torn tail.
+    const uint32_t expected_crc = DecodeFixed32(buf.data() + offset);
+    const uint32_t length = DecodeFixed32(buf.data() + offset + 4);
+    if (buf.size() - offset - kManifestRecordHeaderSize < length) break;
+
+    const char* payload = buf.data() + offset + kManifestRecordHeaderSize;
+    if (crc32c::Value(payload, length) != expected_crc) {
+      // A torn or mis-CRC'd record is the commit that was in flight when we
+      // died. It never completed, so everything it described is discarded --
+      // the SSTables it added become orphans that cleanup will remove.
+      break;
+    }
+    offset += kManifestRecordHeaderSize + length;
+    ++records;
+
+    std::string_view rest(payload, length);
+    if (rest.size() < 25) return Status::Corruption("manifest record too short");
+    const uint8_t kind = static_cast<uint8_t>(rest[0]);
+    next_file_number_ = DecodeFixed64(rest.data() + 1);
+    last_sequence_ = DecodeFixed64(rest.data() + 9);
+    *log_number = DecodeFixed64(rest.data() + 17);
+    rest.remove_prefix(25);
+
+    if (kind == kRecordSnapshot) live.clear();
+
+    if (rest.size() < 4) return Status::Corruption("manifest record truncated");
+    uint32_t num_added = DecodeFixed32(rest.data());
+    rest.remove_prefix(4);
+    for (uint32_t i = 0; i < num_added; ++i) {
+      if (rest.size() < 20) return Status::Corruption("truncated manifest entry");
+      Entry entry;
+      entry.level = static_cast<int>(DecodeFixed32(rest.data()));
+      entry.number = DecodeFixed64(rest.data() + 4);
+      entry.file_size = DecodeFixed64(rest.data() + 12);
+      rest.remove_prefix(20);
+      std::string_view smallest, largest;
+      if (!GetLengthPrefixed(&rest, &smallest) ||
+          !GetLengthPrefixed(&rest, &largest)) {
+        return Status::Corruption("truncated manifest key");
+      }
+      entry.smallest.assign(smallest);
+      entry.largest.assign(largest);
+      if (entry.level < 0 || entry.level >= kNumLevels) {
+        return Status::Corruption("manifest level out of range");
+      }
+      live[entry.number] = std::move(entry);
+    }
+
+    if (rest.size() < 4) return Status::Corruption("manifest record truncated");
+    uint32_t num_deleted = DecodeFixed32(rest.data());
+    rest.remove_prefix(4);
+    for (uint32_t i = 0; i < num_deleted; ++i) {
+      if (rest.size() < 12) return Status::Corruption("truncated manifest entry");
+      const uint64_t number = DecodeFixed64(rest.data() + 4);
+      rest.remove_prefix(12);
+      live.erase(number);
+    }
+    if (!rest.empty()) return Status::Corruption("manifest record has trailing bytes");
+  }
+  if (records == 0) return Status::Corruption("manifest has no usable records");
+  manifest_size_ = offset;
 
   auto version = std::make_shared<Version>();
-  for (uint32_t i = 0; i < num_files; ++i) {
-    if (rest.size() < 20) return Status::Corruption("truncated manifest entry");
-    const uint32_t level = DecodeFixed32(rest.data());
+  for (auto& kv : live) {
     auto meta = std::make_shared<FileMetaData>();
-    meta->number = DecodeFixed64(rest.data() + 4);
-    meta->file_size = DecodeFixed64(rest.data() + 12);
-    rest.remove_prefix(20);
-
-    std::string_view smallest, largest;
-    if (!GetLengthPrefixed(&rest, &smallest) ||
-        !GetLengthPrefixed(&rest, &largest)) {
-      return Status::Corruption("truncated manifest key");
-    }
-    meta->smallest.assign(smallest);
-    meta->largest.assign(largest);
-    if (level >= kNumLevels) return Status::Corruption("manifest level out of range");
+    meta->number = kv.second.number;
+    meta->file_size = kv.second.file_size;
+    meta->smallest = std::move(kv.second.smallest);
+    meta->largest = std::move(kv.second.largest);
 
     std::unique_ptr<Table> table;
     const Status s = Table::Open(TablePath(meta->number), options_, &table,
                                  block_cache_, meta->number);
     if (!s.ok()) return s;
     meta->table = std::shared_ptr<Table>(table.release());
-    version->levels[level].push_back(std::move(meta));
+    version->levels[kv.second.level].push_back(std::move(meta));
   }
 
   // L0 is kept newest-first so a lookup finds the most recent version first.
@@ -350,6 +513,14 @@ Status DB::Recover() {
 
   uint64_t manifest_log_number = 0;
   Status s = LoadManifest(&manifest_log_number);
+  if (!s.ok()) return s;
+
+  // Start a fresh snapshot manifest before anything else can commit. It
+  // collapses whatever edits the previous run accumulated, creates the manifest
+  // for a brand new database, and leaves the file open for appends -- which the
+  // recovery flush below depends on.
+  s = RewriteManifest(*current_, manifest_log_number, next_file_number_,
+                      last_sequence_);
   if (!s.ok()) return s;
 
   // Replay every log at or after the one the manifest committed against. There
@@ -399,8 +570,12 @@ Status DB::Recover() {
   if (!s.ok()) return s;
   log_number_ = new_log;
 
-  s = WriteManifest(*current_, OldestLiveLog(), next_file_number_,
-                    last_sequence_);
+  // Record the new log number so a later recovery knows which logs it still
+  // needs. Nothing else changed, so this is an edit with an empty file set.
+  s = AppendManifestRecord(EncodeManifestRecord(/*snapshot=*/false, VersionEdit(),
+                                                OldestLiveLog(),
+                                                next_file_number_,
+                                                last_sequence_));
   if (!s.ok()) return s;
 
   RemoveObsoleteFiles(*current_, OldestLiveLog());

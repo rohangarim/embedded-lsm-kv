@@ -63,6 +63,11 @@ struct Options {
   // deterministic behaviour in tests.
   bool background_compaction = true;
 
+  // Collapse the manifest's accumulated edits back into a single snapshot once
+  // it grows past this. Larger means fewer rewrites but a longer replay at
+  // open; the cost of a rewrite is proportional to the number of live files.
+  uint64_t manifest_rewrite_bytes = 1u << 20;  // 1 MiB
+
   // Paranoid CRC verification of every block read from an SSTable.
   bool verify_checksums = true;
 };
