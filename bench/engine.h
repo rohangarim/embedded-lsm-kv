@@ -28,6 +28,7 @@ struct EngineConfig {
   size_t block_cache_bytes = 8u << 20;
   bool sync_every_write = false;
   bool verify_checksums = true;
+  lsm::CompressionType compression = lsm::CompressionType::kNoCompression;
 };
 
 class Engine {
@@ -60,6 +61,7 @@ class LsmEngine : public Engine {
     options.l0_compaction_trigger = 4;
     options.sync_policy = policy;
     options.verify_checksums = config.verify_checksums;
+    options.compression = config.compression;
     options.background_compaction = true;
 
     std::unique_ptr<lsm::DB> db;

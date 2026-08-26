@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+
+#include "lsm/compression.h"
 #include <cstdint>
 
 namespace lsm {
@@ -36,6 +38,12 @@ struct Options {
   // between store only the bytes that differ from their predecessor. Smaller is
   // faster to search and larger compresses better -- 16 is the usual balance.
   int block_restart_interval = 16;
+
+  // Compression for data blocks. A block that does not shrink by at least an
+  // eighth is stored raw regardless, so incompressible data costs only the
+  // attempt. Index and Bloom blocks are never compressed: the filter is already
+  // dense bits, and the index is read once and held.
+  CompressionType compression = CompressionType::kNoCompression;
 
   // Bits of Bloom filter per key. 10 bits/key gives ~1% false positives.
   int bloom_bits_per_key = 10;

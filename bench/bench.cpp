@@ -46,6 +46,11 @@ struct Config {
   std::string engine = "lsmtree";
   size_t block_cache_bytes = 8u << 20;
   bool verify_checksums = true;
+  std::string compression = "none";
+  // Percentage of each value that is random bytes. The default synthetic value
+  // is nearly all padding and compresses far better than real data would, so
+  // this exists to make compression numbers honest rather than flattering.
+  int value_entropy = 0;
   bool keep_db = false;
   double zipf_theta = 0.99;
 };
@@ -59,9 +64,17 @@ std::string MakeKey(uint64_t i) {
   return buf;
 }
 
-std::string MakeValue(uint64_t i, size_t size) {
+std::string MakeValue(uint64_t i, size_t size, int entropy_percent = 0) {
   std::string out = "v" + std::to_string(i) + ":";
   out.resize(size, 'x');
+  if (entropy_percent > 0) {
+    // Deterministic per key, so runs stay comparable.
+    std::mt19937 rng(static_cast<uint32_t>(i * 2654435761u));
+    const size_t random_bytes = size * static_cast<size_t>(entropy_percent) / 100;
+    for (size_t j = 0; j < random_bytes && j < out.size(); ++j) {
+      out[out.size() - 1 - j] = static_cast<char>(rng());
+    }
+  }
   return out;
 }
 
@@ -262,7 +275,7 @@ Result RunLoad(bench::Engine* db, const Config& config) {
   Timer total;
   for (uint64_t i = 0; i < config.num_keys; ++i) {
     const Timer op;
-    const bool ok = db->Put(MakeKey(i), MakeValue(i, config.value_size));
+    const bool ok = db->Put(MakeKey(i), MakeValue(i, config.value_size, config.value_entropy));
     result.latency.Add(op.ElapsedNanos());
     if (!ok) {
       std::fprintf(stderr, "load failed at %llu\n",
@@ -319,7 +332,7 @@ Result RunMixed(bench::Engine* db, const Config& config,
           }
           case Op::kUpdate: {
             if (!db->Put(MakeKey(key_index),
-                         MakeValue(key_index, config.value_size))) {
+                         MakeValue(key_index, config.value_size, config.value_entropy))) {
               errors.fetch_add(1);
             }
             break;
@@ -327,7 +340,7 @@ Result RunMixed(bench::Engine* db, const Config& config,
           case Op::kInsert: {
             const uint64_t id =
                 next_insert_key.fetch_add(1, std::memory_order_relaxed);
-            if (!db->Put(MakeKey(id), MakeValue(id, config.value_size))) {
+            if (!db->Put(MakeKey(id), MakeValue(id, config.value_size, config.value_entropy))) {
               errors.fetch_add(1);
             }
             break;
@@ -341,7 +354,7 @@ Result RunMixed(bench::Engine* db, const Config& config,
             db->Get(MakeKey(key_index), &value, &error);
             if (error) errors.fetch_add(1);
             if (!db->Put(MakeKey(key_index),
-                         MakeValue(key_index + 1, config.value_size))) {
+                         MakeValue(key_index + 1, config.value_size, config.value_entropy))) {
               errors.fetch_add(1);
             }
             break;
@@ -398,6 +411,8 @@ int main(int argc, char** argv) {
     else if (arg == "--engine" && i + 1 < argc) config.engine = next();
     else if (arg == "--block-cache-mb" && i + 1 < argc) config.block_cache_bytes = std::strtoull(next().c_str(), nullptr, 10) << 20;
     else if (arg == "--no-verify-checksums") config.verify_checksums = false;
+    else if (arg == "--compression" && i + 1 < argc) config.compression = next();
+    else if (arg == "--value-entropy" && i + 1 < argc) config.value_entropy = std::atoi(next().c_str());
     else if (arg == "--keep") config.keep_db = true;
     else {
       std::fprintf(stderr,
@@ -420,6 +435,9 @@ int main(int argc, char** argv) {
   engine_config.bloom_bits_per_key = 10;
   engine_config.block_cache_bytes = config.block_cache_bytes;
   engine_config.verify_checksums = config.verify_checksums;
+  engine_config.compression = config.compression == "zlib"
+                                  ? lsm::CompressionType::kZlib
+                                  : lsm::CompressionType::kNoCompression;
   engine_config.sync_every_write = config.sync_policy == "every";
 
   std::unique_ptr<bench::Engine> db;
@@ -450,7 +468,9 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(config.num_keys),
               static_cast<unsigned long long>(config.num_ops), config.value_size,
               config.threads, config.sync_policy.c_str());
-  std::printf("  block_cache=%zu MiB\n", config.block_cache_bytes >> 20);
+  std::printf("  block_cache=%zu MiB compression=%s value_entropy=%d%%\n",
+              config.block_cache_bytes >> 20, config.compression.c_str(),
+              config.value_entropy);
 
   PrintHeader();
   for (const std::string& name : Split(config.workloads, ',')) {

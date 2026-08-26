@@ -25,7 +25,9 @@ namespace lsm {
 //   [index block]
 //   [footer : 40 bytes, fixed]
 //
-// Every block is followed by a 4-byte CRC of its contents.
+// Every block is followed by a 1-byte compression type and a 4-byte CRC. The
+// CRC covers the stored bytes and the type together, so a block cannot be
+// decompressed the wrong way without being detected.
 //
 // Data block contents: prefix-compressed entries followed by a restart array.
 //
@@ -53,8 +55,8 @@ constexpr size_t kFooterSize = 40;
 // Bumped when the data block format gained restart points and prefix
 // compression. An older file now fails at open with a clear corruption error
 // rather than being decoded as garbage.
-constexpr uint64_t kTableMagic = 0x4c534d5442aa5502ull;
-constexpr size_t kBlockTrailerSize = 4;  // crc32c
+constexpr uint64_t kTableMagic = 0x4c534d5442aa5503ull;
+constexpr size_t kBlockTrailerSize = 5;  // compression type + crc32c
 
 // Immutable-file writer. Keys must be added in ascending internal-key order.
 class TableBuilder {
@@ -83,8 +85,11 @@ class TableBuilder {
 
  private:
   Status FlushDataBlock();
-  // Appends contents + CRC, returns the handle of the written block.
-  Status WriteBlock(const std::string& contents, uint64_t* offset, uint64_t* size);
+  // Appends contents + trailer, returns the handle of the written block.
+  // `compressible` is false for the index and Bloom blocks.
+  Status WriteBlock(const std::string& contents, bool compressible,
+                    uint64_t* offset, uint64_t* size);
+  std::string compress_buf_;
 
   Options options_;
   std::string path_;

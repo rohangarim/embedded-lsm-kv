@@ -34,6 +34,7 @@ add_library(lsm
   src/block.cpp
   src/bloom.cpp
   src/cache.cpp
+  src/compression.cpp
   src/crc32c.cpp
   src/db.cpp
   src/iterator.cpp
@@ -47,6 +48,18 @@ target_compile_options(lsm PRIVATE -Wall -Wextra -Wpedantic)
 
 find_package(Threads REQUIRED)
 target_link_libraries(lsm PUBLIC Threads::Threads)
+
+# Optional block compression. zlib ships with macOS and every Linux distro, so
+# this is not a third-party dependency; without it the library still builds and
+# CompressionType::kZlib simply reports NotSupported.
+find_package(ZLIB)
+if(ZLIB_FOUND)
+  target_compile_definitions(lsm PUBLIC LSM_HAVE_ZLIB)
+  target_link_libraries(lsm PUBLIC ZLIB::ZLIB)
+  message(STATUS "Block compression enabled (zlib ${ZLIB_VERSION_STRING})")
+else()
+  message(STATUS "zlib not found; block compression unavailable")
+endif()
 
 if(LSM_BUILD_BENCH)
   add_executable(lsm_bench bench/bench.cpp)
@@ -91,6 +104,7 @@ if(LSM_BUILD_TESTS)
     tests/test_block.cpp
     tests/test_bloom.cpp
     tests/test_cache.cpp
+    tests/test_compression.cpp
     tests/test_crc32c.cpp
     tests/test_skiplist.cpp
     tests/test_iterator.cpp

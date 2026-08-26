@@ -6,7 +6,8 @@ immutable, block-structured SSTables; leveled compaction merges them back down
 and reclaims the space that overwrites and deletes leave behind.
 
 No dependencies beyond the standard library and POSIX. GoogleTest is fetched by
-CMake for the test build only.
+CMake for the test build only, and block compression uses zlib when CMake finds
+it — the library builds and runs without it either way.
 
 ```cpp
 #include "lsm/db.h"
@@ -98,6 +99,7 @@ they get the same guarantee.
 | Write-ahead log | [`include/lsm/wal.h`](include/lsm/wal.h), [`src/wal.cpp`](src/wal.cpp) | CRC-32C per record, three fsync policies |
 | SSTable | [`include/lsm/sstable.h`](include/lsm/sstable.h), [`src/sstable.cpp`](src/sstable.cpp) | Data blocks + sparse index + bloom + footer |
 | Data block format | [`include/lsm/block.h`](include/lsm/block.h), [`src/block.cpp`](src/block.cpp) | Prefix compression + restart points |
+| Compression | [`include/lsm/compression.h`](include/lsm/compression.h), [`src/compression.cpp`](src/compression.cpp) | Optional zlib, per-block, off by default |
 | Bloom filter | [`include/lsm/bloom.h`](include/lsm/bloom.h), [`src/bloom.cpp`](src/bloom.cpp) | Configurable bits/key, double hashing |
 | Block cache | [`include/lsm/cache.h`](include/lsm/cache.h), [`src/cache.cpp`](src/cache.cpp) | Sharded LRU over decoded data blocks |
 | Snapshots | [`include/lsm/db.h`](include/lsm/db.h) | Pinned read sequence; gates version collapse |
@@ -154,6 +156,46 @@ interval, rather than walking the block from byte zero.
 Both effects are measurable. Prefix compression alone cuts a 200-entry block of
 these keys by 15.9%, and the whole 500 000-key database now occupies 57 MiB on
 disk — the same as LevelDB, which uses the same technique.
+
+### Compression
+
+Off by default; `Options::compression = CompressionType::kZlib` turns it on for
+data blocks. The type is written next to each block rather than in the footer,
+so a file can hold a mix — and it does, because a block that fails to shrink by
+at least an eighth is stored raw instead. The type byte sits inside the
+checksum, so a block cannot be decompressed the wrong way without the CRC
+catching it. Index and Bloom blocks are never compressed: the filter is already
+dense bits, and the index is read once and held.
+
+It is off by default because it is a real trade, not a free win. Measured at
+300 000 keys with 100-byte values:
+
+| Value shape | Uncompressed | zlib | Space |
+|---|---:|---:|---:|
+| synthetic benchmark values (mostly padding) | 34 MiB | 4 MiB | −88% |
+| 60% random bytes | 34 MiB | 22 MiB | −35% |
+| 100% random bytes | 34 MiB | 34 MiB | 0% |
+
+The first row is the number it would be tempting to quote and the least
+meaningful — the benchmark's values are `"v<i>:"` followed by padding, far more
+compressible than real data. The 60% row is the honest one. The last row is the
+one worth checking: incompressible data costs nothing in space, because the
+writer notices and stores those blocks raw.
+
+The cost, at 60% entropy:
+
+| Workload | Uncompressed | zlib |
+|---|---:|---:|
+| load | 314 347 | 238 930 |
+| C (100% read) | 1 285 824 | 546 255 |
+| E (scan) | 247 671 | 159 910 |
+
+35% of the space for 58% of the read throughput is a bad trade on this hardware,
+which is precisely why production engines default to Snappy or LZ4 rather than
+zlib — they give up some ratio to decompress several times faster. The codec is
+behind a small interface (`CompressBlock` / `UncompressBlock`), so adding one is
+a drop-in; zlib is here because it ships with the platform and needed no
+dependency.
 
 ### Read path
 
@@ -227,7 +269,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 158 tests
+ctest --test-dir build --output-on-failure   # 169 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```

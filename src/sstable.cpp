@@ -11,6 +11,7 @@
 
 #include "lsm/block.h"
 #include "lsm/coding.h"
+#include "lsm/compression.h"
 #include "lsm/crc32c.h"
 
 namespace lsm {
@@ -108,20 +109,32 @@ Status TableBuilder::Add(std::string_view internal_key, std::string_view value) 
   return Status::OK();
 }
 
-Status TableBuilder::WriteBlock(const std::string& contents, uint64_t* offset,
-                                uint64_t* size) {
-  *offset = file_size_;
-  *size = contents.size();
+Status TableBuilder::WriteBlock(const std::string& contents, bool compressible,
+                                uint64_t* offset, uint64_t* size) {
+  std::string_view stored(contents);
+  CompressionType type = CompressionType::kNoCompression;
+  if (compressible &&
+      CompressBlock(options_.compression, contents, &compress_buf_, &type)) {
+    stored = compress_buf_;
+  }
 
-  Status s = WriteFully(fd_, contents.data(), contents.size());
+  *offset = file_size_;
+  *size = stored.size();
+
+  Status s = WriteFully(fd_, stored.data(), stored.size());
   if (!s.ok()) return s;
 
-  std::string trailer;
-  PutFixed32(&trailer, crc32c::Value(contents.data(), contents.size()));
+  // The type byte is inside the checksum, so a block cannot be decompressed the
+  // wrong way without the CRC catching it.
+  std::string trailer(1, static_cast<char>(type));
+  const uint32_t crc =
+      crc32c::Extend(crc32c::Value(stored.data(), stored.size()),
+                     trailer.data(), 1);
+  PutFixed32(&trailer, crc);
   s = WriteFully(fd_, trailer.data(), trailer.size());
   if (!s.ok()) return s;
 
-  file_size_ += contents.size() + kBlockTrailerSize;
+  file_size_ += stored.size() + kBlockTrailerSize;
   return Status::OK();
 }
 
@@ -130,7 +143,7 @@ Status TableBuilder::FlushDataBlock() {
 
   const std::string contents = block_.Finish();
   uint64_t offset = 0, size = 0;
-  const Status s = WriteBlock(contents, &offset, &size);
+  const Status s = WriteBlock(contents, /*compressible=*/true, &offset, &size);
   if (!s.ok()) return s;
 
   // One index entry per block, keyed by the block's largest key: a binary
@@ -150,11 +163,11 @@ Status TableBuilder::Finish() {
 
   const std::string bloom = BloomFilter::Build(filter_keys_, options_.bloom_bits_per_key);
   uint64_t bloom_offset = 0, bloom_size = 0;
-  s = WriteBlock(bloom, &bloom_offset, &bloom_size);
+  s = WriteBlock(bloom, /*compressible=*/false, &bloom_offset, &bloom_size);
   if (!s.ok()) return s;
 
   uint64_t index_offset = 0, index_size = 0;
-  s = WriteBlock(index_block_, &index_offset, &index_size);
+  s = WriteBlock(index_block_, /*compressible=*/false, &index_offset, &index_size);
   if (!s.ok()) return s;
 
   std::string footer;
@@ -306,12 +319,23 @@ Status Table::ReadBlock(uint64_t offset, uint64_t size, BlockCache::Handle* out,
   const Status s = ReadFullyAt(fd_, offset, size + kBlockTrailerSize, &buf);
   if (!s.ok()) return s;
 
-  const uint32_t stored = DecodeFixed32(buf.data() + size);
-  if (verify_checksums_ && crc32c::Value(buf.data(), size) != stored) {
+  const auto type = static_cast<CompressionType>(
+      static_cast<uint8_t>(buf[size]));
+  const uint32_t stored = DecodeFixed32(buf.data() + size + 1);
+  if (verify_checksums_ &&
+      crc32c::Extend(crc32c::Value(buf.data(), size), buf.data() + size, 1) !=
+          stored) {
     return Status::Corruption(path_ + ": block checksum mismatch");
   }
   buf.resize(size);
   stats_->blocks_read.fetch_add(1, std::memory_order_relaxed);
+
+  if (type != CompressionType::kNoCompression) {
+    std::string plain;
+    const Status decompressed = UncompressBlock(type, buf, &plain);
+    if (!decompressed.ok()) return decompressed;
+    buf = std::move(plain);
+  }
 
   if (use_cache) {
     *out = cache_->Insert(file_number_, offset, std::move(buf));
