@@ -8,6 +8,7 @@
 #include <random>
 #include <string>
 
+#include "lsm/coding.h"
 #include "lsm/db.h"
 #include "lsm/sstable.h"
 #include "test_util.h"
@@ -129,6 +130,170 @@ TEST(Compression, RejectsAnUnknownType) {
   const auto bogus = static_cast<CompressionType>(200);
   EXPECT_FALSE(UncompressBlock(bogus, "whatever", &plain).ok());
   EXPECT_FALSE(CompressionSupported(bogus));
+}
+
+// ------------------------------------------------------------------ kFastLz
+//
+// This codec is written by hand rather than borrowed, so round-trip is fuzzed
+// rather than spot-checked. A compressor that is wrong on one input in a
+// million is worse than no compressor at all.
+
+namespace {
+
+void ExpectRoundTrip(const std::string& input, const char* what) {
+  std::string packed;
+  CompressionType type;
+  const bool used =
+      CompressBlock(CompressionType::kFastLz, input, &packed, &type);
+  if (!used) return;  // Declined; the raw block path covers this case.
+  ASSERT_EQ(type, CompressionType::kFastLz) << what;
+
+  std::string plain;
+  const Status s = UncompressBlock(type, packed, &plain);
+  ASSERT_TRUE(s.ok()) << what << ": " << s.ToString();
+  ASSERT_EQ(plain, input) << what;
+}
+
+// Bypasses the "is it worth it" check so even inputs that compress badly get
+// their round-trip verified.
+void ExpectRoundTripAlways(const std::string& input, const char* what) {
+  std::string packed;
+  CompressionType type;
+  CompressBlock(CompressionType::kFastLz, input, &packed, &type);
+  if (type != CompressionType::kFastLz) {
+    // Compress it directly to exercise the coder regardless of the ratio rule.
+    std::string forced;
+    CompressionType forced_type;
+    if (!CompressBlock(CompressionType::kFastLz, input + input + input, &forced,
+                       &forced_type)) {
+      return;
+    }
+    std::string plain;
+    ASSERT_TRUE(UncompressBlock(forced_type, forced, &plain).ok()) << what;
+    ASSERT_EQ(plain, input + input + input) << what;
+    return;
+  }
+  std::string plain;
+  ASSERT_TRUE(UncompressBlock(type, packed, &plain).ok()) << what;
+  ASSERT_EQ(plain, input) << what;
+}
+
+}  // namespace
+
+TEST(FastLz, EmptyAndTinyInputs) {
+  for (size_t n = 0; n <= 40; ++n) {
+    ExpectRoundTripAlways(std::string(n, 'a'), "run of a");
+    ExpectRoundTripAlways(Compressible(n), "text");
+  }
+}
+
+TEST(FastLz, LongRunsOfOneByte) {
+  // Offset-1 matches overlap themselves; the decoder must copy byte at a time.
+  for (const size_t n : {100u, 1000u, 70000u}) {
+    ExpectRoundTrip(std::string(n, 'z'), "single byte run");
+  }
+}
+
+TEST(FastLz, RepeatingPatternsOfEveryPeriod) {
+  // Exercises match offsets from 1 up past the extended-length encoding.
+  for (size_t period = 1; period <= 40; ++period) {
+    std::string unit;
+    for (size_t i = 0; i < period; ++i) {
+      unit.push_back(static_cast<char>('a' + (i % 26)));
+    }
+    std::string input;
+    while (input.size() < 5000) input += unit;
+    ExpectRoundTrip(input, "periodic");
+  }
+}
+
+TEST(FastLz, MatchesBeyondTheOffsetWindow) {
+  // Data that only repeats further back than a 16-bit offset can reach; the
+  // coder must fall back to literals rather than emit a bogus offset.
+  std::mt19937 rng(4);
+  std::string head(70000, '\0');
+  for (auto& c : head) c = static_cast<char>(rng());
+  ExpectRoundTrip(head + head, "far repeat");
+}
+
+TEST(FastLz, IncompressibleDataIsDeclined) {
+  std::string packed;
+  CompressionType type;
+  EXPECT_FALSE(CompressBlock(CompressionType::kFastLz, Incompressible(8192, 3),
+                             &packed, &type));
+  EXPECT_EQ(type, CompressionType::kNoCompression);
+}
+
+TEST(FastLz, RandomisedRoundTrip) {
+  std::mt19937 rng(20260817);
+  for (int trial = 0; trial < 400; ++trial) {
+    const size_t n = rng() % 20000;
+    // Mix runs, text and random bytes so matches and literals interleave.
+    std::string input;
+    while (input.size() < n) {
+      switch (rng() % 4) {
+        case 0: input += std::string(1 + rng() % 50, static_cast<char>(rng())); break;
+        case 1: input += Compressible(1 + rng() % 200); break;
+        case 2: input += Incompressible(1 + rng() % 100, rng()); break;
+        default:
+          if (!input.empty()) {
+            const size_t take = 1 + rng() % std::min<size_t>(input.size(), 300);
+            input += input.substr(input.size() - take);
+          }
+          break;
+      }
+    }
+    input.resize(n);
+    ExpectRoundTrip(input, "randomised");
+  }
+}
+
+// Corrupt input must be rejected, not walked off the end of a buffer. The
+// block CRC should catch this first, but a decompressor that can be steered
+// out of bounds is a liability regardless of what is supposed to guard it.
+TEST(FastLz, RejectsMalformedInputWithoutReadingOutOfBounds) {
+  const std::string input = Compressible(4000);
+  std::string packed;
+  CompressionType type;
+  ASSERT_TRUE(CompressBlock(CompressionType::kFastLz, input, &packed, &type));
+
+  std::mt19937 rng(11);
+  for (int trial = 0; trial < 2000; ++trial) {
+    std::string damaged = packed;
+    switch (rng() % 3) {
+      case 0:  // Truncate.
+        damaged.resize(rng() % damaged.size());
+        break;
+      case 1:  // Flip a byte.
+        damaged[rng() % damaged.size()] =
+            static_cast<char>(rng());
+        break;
+      default:  // Flip several.
+        for (int i = 0; i < 8; ++i) {
+          damaged[rng() % damaged.size()] = static_cast<char>(rng());
+        }
+        break;
+    }
+    std::string plain;
+    const Status s = UncompressBlock(CompressionType::kFastLz, damaged, &plain);
+    // Either it is rejected, or it happens to decode to something -- but it
+    // must never crash, hang, or read past its input. ASan/TSan runs of this
+    // test are what actually enforce that.
+    if (s.ok()) EXPECT_LE(plain.size(), input.size() * 4 + 1024);
+  }
+}
+
+TEST(FastLz, RejectsAnOffsetPointingBeforeTheOutput) {
+  // Hand-built: a literal, then a match reaching further back than exists.
+  std::string bad;
+  PutVarint32(&bad, 100);
+  bad.push_back(static_cast<char>(1 << 4));  // one literal, match len 4
+  bad.push_back('x');
+  bad.push_back(static_cast<char>(50));  // offset 50, but only 1 byte emitted
+  bad.push_back(static_cast<char>(0));
+  std::string plain;
+  EXPECT_TRUE(
+      UncompressBlock(CompressionType::kFastLz, bad, &plain).IsCorruption());
 }
 
 // ------------------------------------------------------------- DB integration

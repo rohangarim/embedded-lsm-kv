@@ -418,7 +418,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr,
                    "usage: %s [--db PATH] [--keys N] [--ops N] [--value-size N]\n"
                    "          [--threads N] [--scan-length N] [--sync every|interval|never]\n"
-                   "          [--workloads load,A,B,C,D,E,F] [--engine lsmtree|leveldb] [--keep]\n",
+                   "          [--workloads load,A,B,C,D,E,F] [--engine lsmtree|leveldb]\n"
+                   "          [--compression none|fastlz|zlib] [--value-entropy 0-100] [--keep]\n",
                    argv[0]);
       return 2;
     }
@@ -435,9 +436,13 @@ int main(int argc, char** argv) {
   engine_config.bloom_bits_per_key = 10;
   engine_config.block_cache_bytes = config.block_cache_bytes;
   engine_config.verify_checksums = config.verify_checksums;
-  engine_config.compression = config.compression == "zlib"
-                                  ? lsm::CompressionType::kZlib
-                                  : lsm::CompressionType::kNoCompression;
+  if (config.compression == "zlib") {
+    engine_config.compression = lsm::CompressionType::kZlib;
+  } else if (config.compression == "fastlz") {
+    engine_config.compression = lsm::CompressionType::kFastLz;
+  } else {
+    engine_config.compression = lsm::CompressionType::kNoCompression;
+  }
   engine_config.sync_every_write = config.sync_policy == "every";
 
   std::unique_ptr<bench::Engine> db;

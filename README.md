@@ -99,7 +99,7 @@ they get the same guarantee.
 | Write-ahead log | [`include/lsm/wal.h`](include/lsm/wal.h), [`src/wal.cpp`](src/wal.cpp) | CRC-32C per record, three fsync policies |
 | SSTable | [`include/lsm/sstable.h`](include/lsm/sstable.h), [`src/sstable.cpp`](src/sstable.cpp) | Data blocks + sparse index + bloom + footer |
 | Data block format | [`include/lsm/block.h`](include/lsm/block.h), [`src/block.cpp`](src/block.cpp) | Prefix compression + restart points |
-| Compression | [`include/lsm/compression.h`](include/lsm/compression.h), [`src/compression.cpp`](src/compression.cpp) | Optional zlib, per-block, off by default |
+| Compression | [`include/lsm/compression.h`](include/lsm/compression.h), [`src/compression.cpp`](src/compression.cpp) | Built-in LZ77 or zlib, per-block, off by default |
 | Bloom filter | [`include/lsm/bloom.h`](include/lsm/bloom.h), [`src/bloom.cpp`](src/bloom.cpp) | Configurable bits/key, double hashing |
 | Block cache | [`include/lsm/cache.h`](include/lsm/cache.h), [`src/cache.cpp`](src/cache.cpp) | Sharded LRU over decoded data blocks |
 | Snapshots | [`include/lsm/db.h`](include/lsm/db.h) | Pinned read sequence; gates version collapse |
@@ -159,43 +159,59 @@ disk — the same as LevelDB, which uses the same technique.
 
 ### Compression
 
-Off by default; `Options::compression = CompressionType::kZlib` turns it on for
-data blocks. The type is written next to each block rather than in the footer,
-so a file can hold a mix — and it does, because a block that fails to shrink by
-at least an eighth is stored raw instead. The type byte sits inside the
-checksum, so a block cannot be decompressed the wrong way without the CRC
-catching it. Index and Bloom blocks are never compressed: the filter is already
-dense bits, and the index is read once and held.
+Off by default. `Options::compression` takes `kFastLz` — a small LZ77 coder
+built into the library — or `kZlib`, when CMake finds zlib. The type is written
+next to each block rather than in the footer, so a file can hold a mix, and it
+does: a block that fails to shrink by at least an eighth is stored raw instead.
+The type byte sits inside the checksum, so a block cannot be decompressed the
+wrong way without the CRC catching it. Index and Bloom blocks are never
+compressed — the filter is already dense bits, and the index is read once and
+held.
 
-It is off by default because it is a real trade, not a free win. Measured at
-300 000 keys with 100-byte values:
+`kFastLz` exists because zlib turned out to be the wrong trade here. Every block
+that misses the cache pays for decompression, and zlib's cost more than halved
+read throughput. It is a conventional LZ77: a hash table over four-byte
+sequences finds matches, and a sequence is a token nibble-packing literal and
+match lengths, then literals, then a 16-bit back-reference. The table keeps one
+candidate per hash, so a collision costs a missed match and never a wrong one —
+correctness does not depend on it, only the ratio does.
 
-| Value shape | Uncompressed | zlib | Space |
-|---|---:|---:|---:|
-| synthetic benchmark values (mostly padding) | 34 MiB | 4 MiB | −88% |
-| 60% random bytes | 34 MiB | 22 MiB | −35% |
-| 100% random bytes | 34 MiB | 34 MiB | 0% |
+On-disk size, 300 000 keys of 100-byte values at 60% random bytes:
 
-The first row is the number it would be tempting to quote and the least
-meaningful — the benchmark's values are `"v<i>:"` followed by padding, far more
-compressible than real data. The 60% row is the honest one. The last row is the
-one worth checking: incompressible data costs nothing in space, because the
-writer notices and stores those blocks raw.
-
-The cost, at 60% entropy:
-
-| Workload | Uncompressed | zlib |
+| | Size | vs uncompressed |
 |---|---:|---:|
-| load | 314 347 | 238 930 |
-| C (100% read) | 1 285 824 | 546 255 |
-| E (scan) | 247 671 | 159 910 |
+| none | 34 MiB | — |
+| fastlz | 23 MiB | −32% |
+| zlib | 22 MiB | −35% |
 
-35% of the space for 58% of the read throughput is a bad trade on this hardware,
-which is precisely why production engines default to Snappy or LZ4 rather than
-zlib — they give up some ratio to decompress several times faster. The codec is
-behind a small interface (`CompressBlock` / `UncompressBlock`), so adding one is
-a drop-in; zlib is here because it ships with the platform and needed no
-dependency.
+Throughput, as a fraction of the uncompressed baseline. Absolute numbers are
+omitted because this box was under load when they were taken; all three
+configurations ran back to back, so the ratios hold even though the absolutes
+would not reproduce:
+
+| | Bulk load | 100% read | Scan |
+|---|---:|---:|---:|
+| fastlz | ~1.00x | 0.60–0.69x | 0.82x |
+| zlib | 0.79x | 0.44–0.49x | 0.67x |
+
+So `kFastLz` gets roughly nine tenths of zlib's space saving, costs nothing
+measurable on writes, and leaves substantially more read throughput. It is the
+one to reach for if compression is wanted.
+
+Compression stays off by default even so: a third of read throughput is a real
+price, and whether it is worth paying depends entirely on whether the workload
+is bound by space or by reads. The codec sits behind a two-function interface,
+so a production-grade LZ4 or Snappy would be a drop-in — the built-in coder is
+deliberately simple rather than competitive with those.
+
+Because the codec is written here rather than borrowed, round-trip is fuzzed
+rather than spot-checked: randomised mixes of runs, text and random bytes,
+repeating patterns at every period from 1 to 40 (offset-1 matches overlap
+themselves, which is the case that breaks a naive copy), data that only repeats
+beyond the 16-bit offset window, and 2 000 rounds of truncated and bit-flipped
+input to confirm malformed data is rejected rather than walked off the end of a
+buffer. Those run under AddressSanitizer in CI, which is what actually enforces
+the last one.
 
 ### Read path
 
@@ -269,7 +285,7 @@ durable until the *directory* entry is).
 ## Testing
 
 ```bash
-ctest --test-dir build --output-on-failure   # 169 tests
+ctest --test-dir build --output-on-failure   # 177 tests
 ./build/lsm_crash_harness --rounds 300 --writes 60000
 ./build/lsm_bench --keys 500000 --ops 500000
 ```

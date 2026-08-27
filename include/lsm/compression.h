@@ -14,6 +14,10 @@ namespace lsm {
 enum class CompressionType : uint8_t {
   kNoCompression = 0,
   kZlib = 1,
+  // A small LZ77 codec built into the library. Compresses less than zlib but
+  // decompresses several times faster, which is the trade that matters when
+  // every block read pays for it. See src/compression.cpp for the format.
+  kFastLz = 2,
 };
 
 // Compresses `input`. Returns false when the result would not be worth using,
