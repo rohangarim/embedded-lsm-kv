@@ -85,6 +85,8 @@ if(LSM_BUILD_BENCH)
   target_link_libraries(lsm_crash_worker PRIVATE lsm)
 
   add_executable(lsm_crash_harness tools/crash_harness.cpp)
+  add_executable(lsm_bloom_ab tools/bloom_ab.cpp)
+  target_link_libraries(lsm_bloom_ab PRIVATE lsm)
   target_link_libraries(lsm_crash_harness PRIVATE lsm)
 endif()
 
