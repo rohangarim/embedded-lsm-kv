@@ -161,7 +161,15 @@ Status TableBuilder::Finish() {
   Status s = FlushDataBlock();
   if (!s.ok()) return s;
 
-  const std::string bloom = BloomFilter::Build(filter_keys_, options_.bloom_bits_per_key);
+  // bloom_bits_per_key <= 0 writes an EMPTY bloom block, which BloomFilter
+  // decodes as "no filter" and answers MayContain() with true for every key.
+  // This exists so the filter can be A/B tested against itself; Build() floors
+  // at 64 bits and 1 probe, so passing 0 would otherwise still produce a
+  // working (and rejecting) filter. No effect on any positive bits/key.
+  const std::string bloom =
+      options_.bloom_bits_per_key > 0
+          ? BloomFilter::Build(filter_keys_, options_.bloom_bits_per_key)
+          : std::string();
   uint64_t bloom_offset = 0, bloom_size = 0;
   s = WriteBlock(bloom, /*compressible=*/false, &bloom_offset, &bloom_size);
   if (!s.ok()) return s;
