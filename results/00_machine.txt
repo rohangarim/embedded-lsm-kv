@@ -1,0 +1,25 @@
+# Machine and build environment
+# Recorded: 2026-08-27T07:41:15Z UTC
+
+## Host
+CPU model      : Apple M4
+Cores (logical): 10
+Cores (physical): 10
+RAM bytes      : 17179869184  (16 GiB)
+OS             : macOS 26.3.1 (build 25D771280a)
+Kernel         : Darwin 25.3.0 arm64
+
+## Storage
+Mount Point:               /
+File System Personality:   APFS
+Protocol:                  Apple Fabric
+Solid State:               Yes
+
+## Compiler
+Apple clang version 17.0.0 (clang-1700.6.4.2)
+Target: arm64-apple-darwin25.3.0
+cmake          : cmake version 4.4.2
+ninja          : 1.13.2
+
+## Load at recording time
+ 3:41  up 139 days, 3 hrs, 1 user, load averages: 7.29 6.88 6.83
