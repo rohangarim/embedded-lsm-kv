@@ -1,0 +1,312 @@
+# Crash harness re-audit, matching README's claimed round count
+# recorded: 2026-09-11T21:18:04Z
+# git: 82d1e5f + working tree
+# binary: build-audit2/lsm_crash_harness (RelWithDebInfo, fresh build)
+# command: ./lsm_crash_harness --rounds 300 --worker ./lsm_crash_worker --dir <scratch> --verbose
+
+fault injection: 300 rounds, up to 20000 writes each, seed 1
+round   0 ok (every   ) acked=33      recovered=34     
+round   1 ok (interval) acked=2638    recovered=2639   
+round   2 ok (never   ) acked=2730    recovered=2730   
+round   3 ok (every   ) acked=26      recovered=27     
+round   4 ok (interval) acked=2879    recovered=2879   
+round   5 ok (never   ) acked=8767    recovered=8768   
+round   6 ok (every   ) acked=53      recovered=54     
+round   7 ok (interval) acked=2068    recovered=2069   
+round   8 ok (never   ) acked=7800    recovered=7800   
+round   9 ok (every   ) acked=57      recovered=58     
+round  10 ok (interval) acked=4955    recovered=4956   
+round  11 ok (never   ) acked=6630    recovered=6630   
+round  12 ok (every   ) acked=45      recovered=46     
+round  13 ok (interval) acked=3885    recovered=3886   
+round  14 ok (never   ) acked=0       recovered=0      
+round  15 ok (every   ) acked=64      recovered=65     
+round  16 ok (interval) acked=4680    recovered=4680   
+round  17 ok (never   ) acked=773     recovered=774    
+round  18 ok (every   ) acked=45      recovered=46     
+round  19 ok (interval) acked=1892    recovered=1893   
+round  20 ok (never   ) acked=6594    recovered=6595   
+round  21 ok (every   ) acked=60      recovered=61     
+round  22 ok (interval) acked=4502    recovered=4502   
+round  23 ok (never   ) acked=7800    recovered=7800   
+round  24 ok (every   ) acked=44      recovered=45     
+round  25 ok (interval) acked=3031    recovered=3032   
+round  26 ok (never   ) acked=1951    recovered=1951   
+round  27 ok (every   ) acked=59      recovered=60     
+round  28 ok (interval) acked=2730    recovered=2730   
+round  29 ok (never   ) acked=0       recovered=0      
+round  30 ok (every   ) acked=67      recovered=68     
+round  31 ok (interval) acked=2841    recovered=2842   
+round  32 ok (never   ) acked=7698    recovered=7699   
+round  33 ok (every   ) acked=35      recovered=36     
+round  34 ok (interval) acked=2592    recovered=2593   
+round  35 ok (never   ) acked=3120    recovered=3120   
+round  36 ok (every   ) acked=9       recovered=10     
+round  37 ok (interval) acked=2548    recovered=2549   
+round  38 ok (never   ) acked=6148    recovered=6149   
+round  39 ok (every   ) acked=34      recovered=34     
+round  40 ok (interval) acked=1950    recovered=1951   
+round  41 ok (never   ) acked=1950    recovered=1950   
+round  42 ok (every   ) acked=24      recovered=25     
+round  43 ok (interval) acked=3938    recovered=3939   
+round  44 ok (never   ) acked=5092    recovered=5092   
+round  45 ok (every   ) acked=32      recovered=33     
+round  46 ok (interval) acked=106     recovered=106    
+round  47 ok (never   ) acked=3899    recovered=3900   
+round  48 ok (every   ) acked=45      recovered=46     
+round  49 ok (interval) acked=4290    recovered=4290   
+round  50 ok (never   ) acked=3120    recovered=3120   
+round  51 ok (every   ) acked=52      recovered=53     
+round  52 ok (interval) acked=539     recovered=540    
+round  53 ok (never   ) acked=2229    recovered=2230   
+round  54 ok (every   ) acked=46      recovered=47     
+round  55 ok (interval) acked=3805    recovered=3806   
+round  56 ok (never   ) acked=7800    recovered=7800   
+round  57 ok (every   ) acked=33      recovered=34     
+round  58 ok (interval) acked=4661    recovered=4662   
+round  59 ok (never   ) acked=6240    recovered=6240   
+round  60 ok (every   ) acked=21      recovered=22     
+round  61 ok (interval) acked=5070    recovered=5071   
+round  62 ok (never   ) acked=3120    recovered=3120   
+round  63 ok (every   ) acked=0       recovered=0      
+round  64 ok (interval) acked=0       recovered=0      
+round  65 ok (never   ) acked=1560    recovered=1560   
+round  66 ok (every   ) acked=35      recovered=36     
+round  67 ok (interval) acked=4680    recovered=4680   
+round  68 ok (never   ) acked=2674    recovered=2674   
+round  69 ok (every   ) acked=2       recovered=3      
+round  70 ok (interval) acked=2579    recovered=2580   
+round  71 ok (never   ) acked=7410    recovered=7410   
+round  72 ok (every   ) acked=37      recovered=38     
+round  73 ok (interval) acked=4110    recovered=4111   
+round  74 ok (never   ) acked=6177    recovered=6178   
+round  75 ok (every   ) acked=26      recovered=27     
+round  76 ok (interval) acked=1170    recovered=1171   
+round  77 ok (never   ) acked=3900    recovered=3900   
+round  78 ok (every   ) acked=17      recovered=18     
+round  79 ok (interval) acked=975     recovered=976    
+round  80 ok (never   ) acked=4709    recovered=4710   
+round  81 ok (every   ) acked=50      recovered=51     
+round  82 ok (interval) acked=2083    recovered=2084   
+round  83 ok (never   ) acked=1024    recovered=1025   
+round  84 ok (every   ) acked=16      recovered=17     
+round  85 ok (interval) acked=2077    recovered=2078   
+round  86 ok (never   ) acked=2940    recovered=2941   
+round  87 ok (every   ) acked=13      recovered=14     
+round  88 ok (interval) acked=2158    recovered=2158   
+round  89 ok (never   ) acked=1170    recovered=1170   
+round  90 ok (every   ) acked=27      recovered=28     
+round  91 ok (interval) acked=2085    recovered=2086   
+round  92 ok (never   ) acked=4982    recovered=4983   
+round  93 ok (every   ) acked=40      recovered=41     
+round  94 ok (interval) acked=4826    recovered=4827   
+round  95 ok (never   ) acked=7410    recovered=7410   
+round  96 ok (every   ) acked=2       recovered=3      
+round  97 ok (interval) acked=5403    recovered=5404   
+round  98 ok (never   ) acked=305     recovered=305    
+round  99 ok (every   ) acked=23      recovered=24     
+round 100 ok (interval) acked=1840    recovered=1841   
+round 101 ok (never   ) acked=1950    recovered=1950   
+round 102 ok (every   ) acked=50      recovered=51     
+round 103 ok (interval) acked=3021    recovered=3022   
+round 104 ok (never   ) acked=2897    recovered=2898   
+round 105 ok (every   ) acked=11      recovered=12     
+round 106 ok (interval) acked=4425    recovered=4426   
+round 107 ok (never   ) acked=7410    recovered=7410   
+round 108 ok (every   ) acked=21      recovered=22     
+round 109 ok (interval) acked=5184    recovered=5185   
+round 110 ok (never   ) acked=3577    recovered=3578   
+round 111 ok (every   ) acked=38      recovered=39     
+round 112 ok (interval) acked=1901    recovered=1902   
+round 113 ok (never   ) acked=7410    recovered=7410   
+round 114 ok (every   ) acked=55      recovered=56     
+round 115 ok (interval) acked=1714    recovered=1715   
+round 116 ok (never   ) acked=2730    recovered=2730   
+round 117 ok (every   ) acked=35      recovered=36     
+round 118 ok (interval) acked=1113    recovered=1114   
+round 119 ok (never   ) acked=6055    recovered=6056   
+round 120 ok (every   ) acked=30      recovered=31     
+round 121 ok (interval) acked=5460    recovered=5460   
+round 122 ok (never   ) acked=6687    recovered=6688   
+round 123 ok (every   ) acked=58      recovered=59     
+round 124 ok (interval) acked=3442    recovered=3443   
+round 125 ok (never   ) acked=839     recovered=840    
+round 126 ok (every   ) acked=25      recovered=26     
+round 127 ok (interval) acked=2157    recovered=2158   
+round 128 ok (never   ) acked=3989    recovered=3990   
+round 129 ok (every   ) acked=46      recovered=47     
+round 130 ok (interval) acked=3403    recovered=3404   
+round 131 ok (never   ) acked=2278    recovered=2279   
+round 132 ok (every   ) acked=51      recovered=52     
+round 133 ok (interval) acked=1746    recovered=1747   
+round 134 ok (never   ) acked=7255    recovered=7256   
+round 135 ok (every   ) acked=52      recovered=53     
+round 136 ok (interval) acked=0       recovered=0      
+round 137 ok (never   ) acked=4168    recovered=4168   
+round 138 ok (every   ) acked=16      recovered=17     
+round 139 ok (interval) acked=620     recovered=621    
+round 140 ok (never   ) acked=6630    recovered=6630   
+round 141 ok (every   ) acked=5       recovered=6      
+round 142 ok (interval) acked=668     recovered=669    
+round 143 ok (never   ) acked=1034    recovered=1034   
+round 144 ok (every   ) acked=49      recovered=50     
+round 145 ok (interval) acked=754     recovered=755    
+round 146 ok (never   ) acked=6630    recovered=6630   
+round 147 ok (every   ) acked=40      recovered=41     
+round 148 ok (interval) acked=4484    recovered=4485   
+round 149 ok (never   ) acked=81      recovered=81     
+round 150 ok (every   ) acked=13      recovered=14     
+round 151 ok (interval) acked=1990    recovered=1990   
+round 152 ok (never   ) acked=5869    recovered=5869   
+round 153 ok (every   ) acked=47      recovered=48     
+round 154 ok (interval) acked=2563    recovered=2564   
+round 155 ok (never   ) acked=1950    recovered=1950   
+round 156 ok (every   ) acked=8       recovered=9      
+round 157 ok (interval) acked=4491    recovered=4492   
+round 158 ok (never   ) acked=1560    recovered=1560   
+round 159 ok (every   ) acked=37      recovered=38     
+round 160 ok (interval) acked=3120    recovered=3121   
+round 161 ok (never   ) acked=6576    recovered=6577   
+round 162 ok (every   ) acked=35      recovered=36     
+round 163 ok (interval) acked=3815    recovered=3816   
+round 164 ok (never   ) acked=0       recovered=0      
+round 165 ok (every   ) acked=8       recovered=9      
+round 166 ok (interval) acked=2105    recovered=2106   
+round 167 ok (never   ) acked=4214    recovered=4215   
+round 168 ok (every   ) acked=50      recovered=51     
+round 169 ok (interval) acked=1950    recovered=1950   
+round 170 ok (never   ) acked=1154    recovered=1154   
+round 171 ok (every   ) acked=18      recovered=19     
+round 172 ok (interval) acked=2340    recovered=2340   
+round 173 ok (never   ) acked=8317    recovered=8318   
+round 174 ok (every   ) acked=35      recovered=36     
+round 175 ok (interval) acked=5145    recovered=5146   
+round 176 ok (never   ) acked=6240    recovered=6240   
+round 177 ok (every   ) acked=32      recovered=33     
+round 178 ok (interval) acked=5248    recovered=5249   
+round 179 ok (never   ) acked=88      recovered=89     
+round 180 ok (every   ) acked=10      recovered=11     
+round 181 ok (interval) acked=1080    recovered=1081   
+round 182 ok (never   ) acked=4680    recovered=4680   
+round 183 ok (every   ) acked=28      recovered=29     
+round 184 ok (interval) acked=3982    recovered=3983   
+round 185 ok (never   ) acked=6630    recovered=6630   
+round 186 ok (every   ) acked=22      recovered=23     
+round 187 ok (interval) acked=2578    recovered=2579   
+round 188 ok (never   ) acked=7410    recovered=7410   
+round 189 ok (every   ) acked=63      recovered=64     
+round 190 ok (interval) acked=1406    recovered=1407   
+round 191 ok (never   ) acked=6157    recovered=6158   
+round 192 ok (every   ) acked=56      recovered=57     
+round 193 ok (interval) acked=3361    recovered=3362   
+round 194 ok (never   ) acked=3900    recovered=3900   
+round 195 ok (every   ) acked=46      recovered=47     
+round 196 ok (interval) acked=2936    recovered=2937   
+round 197 ok (never   ) acked=7020    recovered=7020   
+round 198 ok (every   ) acked=1       recovered=2      
+round 199 ok (interval) acked=4268    recovered=4269   
+round 200 ok (never   ) acked=7267    recovered=7268   
+round 201 ok (every   ) acked=41      recovered=42     
+round 202 ok (interval) acked=3042    recovered=3043   
+round 203 ok (never   ) acked=0       recovered=0      
+round 204 ok (every   ) acked=56      recovered=57     
+round 205 ok (interval) acked=3120    recovered=3120   
+round 206 ok (never   ) acked=5850    recovered=5850   
+round 207 ok (every   ) acked=33      recovered=34     
+round 208 ok (interval) acked=4796    recovered=4797   
+round 209 ok (never   ) acked=1950    recovered=1950   
+round 210 ok (every   ) acked=25      recovered=26     
+round 211 ok (interval) acked=1971    recovered=1972   
+round 212 ok (never   ) acked=4595    recovered=4596   
+round 213 ok (every   ) acked=49      recovered=50     
+round 214 ok (interval) acked=0       recovered=0      
+round 215 ok (never   ) acked=8111    recovered=8112   
+round 216 ok (every   ) acked=51      recovered=52     
+round 217 ok (interval) acked=4290    recovered=4290   
+round 218 ok (never   ) acked=3900    recovered=3900   
+round 219 ok (every   ) acked=35      recovered=36     
+round 220 ok (interval) acked=5220    recovered=5221   
+round 221 ok (never   ) acked=3357    recovered=3358   
+round 222 ok (every   ) acked=63      recovered=64     
+round 223 ok (interval) acked=4321    recovered=4322   
+round 224 ok (never   ) acked=0       recovered=0      
+round 225 ok (every   ) acked=37      recovered=38     
+round 226 ok (interval) acked=2568    recovered=2569   
+round 227 ok (never   ) acked=6240    recovered=6240   
+round 228 ok (every   ) acked=40      recovered=41     
+round 229 ok (interval) acked=1365    recovered=1366   
+round 230 ok (never   ) acked=2730    recovered=2730   
+round 231 ok (every   ) acked=22      recovered=23     
+round 232 ok (interval) acked=2854    recovered=2855   
+round 233 ok (never   ) acked=6550    recovered=6551   
+round 234 ok (every   ) acked=48      recovered=49     
+round 235 ok (interval) acked=0       recovered=0      
+round 236 ok (never   ) acked=780     recovered=780    
+round 237 ok (every   ) acked=14      recovered=15     
+round 238 ok (interval) acked=5319    recovered=5320   
+round 239 ok (never   ) acked=7371    recovered=7372   
+round 240 ok (every   ) acked=1       recovered=2      
+round 241 ok (interval) acked=2454    recovered=2455   
+round 242 ok (never   ) acked=3510    recovered=3510   
+round 243 ok (every   ) acked=29      recovered=30     
+round 244 ok (interval) acked=761     recovered=762    
+round 245 ok (never   ) acked=7800    recovered=7800   
+round 246 ok (every   ) acked=48      recovered=49     
+round 247 ok (interval) acked=4680    recovered=4680   
+round 248 ok (never   ) acked=4680    recovered=4680   
+round 249 ok (every   ) acked=42      recovered=43     
+round 250 ok (interval) acked=2386    recovered=2387   
+round 251 ok (never   ) acked=3763    recovered=3764   
+round 252 ok (every   ) acked=56      recovered=57     
+round 253 ok (interval) acked=3312    recovered=3313   
+round 254 ok (never   ) acked=3457    recovered=3458   
+round 255 ok (every   ) acked=18      recovered=19     
+round 256 ok (interval) acked=4680    recovered=4680   
+round 257 ok (never   ) acked=0       recovered=0      
+round 258 ok (every   ) acked=3       recovered=4      
+round 259 ok (interval) acked=5658    recovered=5659   
+round 260 ok (never   ) acked=6112    recovered=6113   
+round 261 ok (every   ) acked=48      recovered=49     
+round 262 ok (interval) acked=0       recovered=0      
+round 263 ok (never   ) acked=5777    recovered=5778   
+round 264 ok (every   ) acked=4       recovered=5      
+round 265 ok (interval) acked=1378    recovered=1379   
+round 266 ok (never   ) acked=7410    recovered=7410   
+round 267 ok (every   ) acked=7       recovered=8      
+round 268 ok (interval) acked=3120    recovered=3120   
+round 269 ok (never   ) acked=6240    recovered=6240   
+round 270 ok (every   ) acked=36      recovered=37     
+round 271 ok (interval) acked=1690    recovered=1691   
+round 272 ok (never   ) acked=4161    recovered=4162   
+round 273 ok (every   ) acked=9       recovered=10     
+round 274 ok (interval) acked=1773    recovered=1774   
+round 275 ok (never   ) acked=5460    recovered=5460   
+round 276 ok (every   ) acked=49      recovered=50     
+round 277 ok (interval) acked=0       recovered=0      
+round 278 ok (never   ) acked=2681    recovered=2682   
+round 279 ok (every   ) acked=44      recovered=45     
+round 280 ok (interval) acked=518     recovered=519    
+round 281 ok (never   ) acked=5460    recovered=5460   
+round 282 ok (every   ) acked=64      recovered=65     
+round 283 ok (interval) acked=970     recovered=971    
+round 284 ok (never   ) acked=6110    recovered=6110   
+round 285 ok (every   ) acked=62      recovered=63     
+round 286 ok (interval) acked=1803    recovered=1804   
+round 287 ok (never   ) acked=4290    recovered=4290   
+round 288 ok (every   ) acked=20      recovered=21     
+round 289 ok (interval) acked=1950    recovered=1950   
+round 290 ok (never   ) acked=971     recovered=972    
+round 291 ok (every   ) acked=44      recovered=45     
+round 292 ok (interval) acked=4670    recovered=4671   
+round 293 ok (never   ) acked=4680    recovered=4680   
+round 294 ok (every   ) acked=34      recovered=35     
+round 295 ok (interval) acked=1829    recovered=1830   
+round 296 ok (never   ) acked=3159    recovered=3159   
+round 297 ok (every   ) acked=24      recovered=25     
+round 298 ok (interval) acked=2619    recovered=2620   
+round 299 ok (never   ) acked=3900    recovered=3901   
+
+300/300 rounds passed; 285 killed by signal mid-operation
+total acknowledged writes: 710021, total recovered: 710234
+RESULT: PASS -- every acknowledged write survived every crash
+./build-audit2/lsm_crash_harness --rounds 300 --worker  --dir  --verbose 2>&1  3.42s user 8.71s system 23% cpu 51.355 total

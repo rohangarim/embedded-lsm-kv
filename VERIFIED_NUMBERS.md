@@ -1,3 +1,85 @@
+# Re-audit — 2026-09-11
+
+The README has been substantially rewritten since the original audit above
+(new LevelDB comparison table, hardware CRC32C, leveled compaction, a manifest
+durability bug writeup). This section re-verifies the claims in the CURRENT
+README against a fresh build of the CURRENT working tree, which includes
+uncommitted changes on top of `82d1e5f` (`block.h`, `iterator.h`, `memtable.h`,
+`skiplist.h`, `db.cpp`, `iterator.cpp`, `sstable.cpp` and their tests — see
+`git diff --stat` at audit time). Scope, per the request: YCSB, the crash
+harness, and the Bloom false-positive rate. Everything else in the README is
+marked NOT MEASURED IN THIS PASS below, not silently assumed correct.
+
+**Machine:** same Apple M4 / 10-core / 16 GiB / APFS-NVMe box as the original
+audit. Load average was NOT clean throughout — an initial YCSB attempt at load
+~4.2–6.1 (Chrome + WindowServer + this session's own processes) produced
+spreads up to 92% between runs and was discarded rather than reported as a
+number. A second attempt at load ~3.3–3.8 came in under 10% spread on every
+workload and is what's reported below.
+
+| Claim (current README) | Status | Measured | Command | Raw output |
+|---|---|---|---|---|
+| "177 unit and integration tests... clean under AddressSanitizer and ThreadSanitizer" | **WRONG** (test count) | 195 tests, all pass | `./lsm_tests` | test count via `--gtest_list_tests`; ASan/TSan not re-run this pass (see below) |
+| YCSB table, lsmtree column (7 workloads) | **VERIFIED** | Within -1.9% to -6.1% of every claimed figure, same direction throughout | `./lsm_bench --db PATH` (defaults: 500K keys, 100B values, sync=never, 8 MiB cache, checksums on, Zipfian θ=0.99) | `results/33_ycsb_reaudit_attempt2.txt` |
+| "On-disk size is 57 MiB for both" (lsmtree side only — LevelDB not re-checked) | **VERIFIED** | 56 MiB after the `load` workload | `./lsm_bench --db PATH --workloads load --keep` + `du -sh` | measured inline, not saved as a separate file |
+| "0.89% false positives measured at 10 bits/key" | **WRONG** | **1.234377%**, over 999,938 probes of genuinely-absent keys | `./lsm_bloom_ab --keys 500000 --hits 200000 --misses 1000000 --bloom-bits 10 --sync never` | `results/32_bloom_fp_reaudit.txt` |
+| "300/300 rounds passed... every acknowledged write survived every crash" | **VERIFIED** | 300/300 passed, 0 lost writes, 710,021 acknowledged / 710,234 recovered | `./lsm_crash_harness --rounds 300 --worker ./lsm_crash_worker --verbose` | `results/31_crash_harness_reaudit.txt` |
+| "298 killed by signal mid-operation" | **UNVERIFIABLE AS STATED** | 285 in this run. See note below — this is not a fixed constant | same run as above | `results/31_crash_harness_reaudit.txt` |
+| LevelDB comparison ratios (0.87x–2.09x) | **NOT MEASURED IN THIS PASS** | — | Would require building/vendoring LevelDB and running `bench/`'s LevelDB adapter; outside the requested scope (YCSB/crash-harness/Bloom only) | — |
+| "Switching to the CPU's CRC32C instruction took reads from 264K to 1.2M ops/sec" | **NOT MEASURED IN THIS PASS** | — | Would require a second build with `LSM_HAVE_HARDWARE_CRC32C` forced off (see `src/crc32c.cpp:85`) and a matched read-only benchmark, before and after | — |
+| "flush took scans from 19K to 151K ops/sec" | **NOT MEASURED IN THIS PASS** | — | Historical before/after around a specific fix; would require checking out the pre-fix revision, which risks disturbing the other agent's in-progress work in this tree | — |
+| "34 of 300 rounds lost exactly one memtable's worth of data" (the manifest bug story) | **NOT MEASURED IN THIS PASS** | — | Same reason: reproducing the historical bug count means running the harness against code before the fix | — |
+
+## On the Bloom finding specifically
+
+This is the strongest finding in this pass, for a reason worth stating: 1.23%
+is not just a different measurement from 0.89%, it is **below the
+theoretical floor** for what this filter can achieve. The textbook optimal
+false-positive rate at 10 bits/key is ~1.00%, achieved at a real-valued probe
+count `k = (m/n)·ln2 ≈ 6.93`. `BloomFilter::BitsPerKeyToProbes` computes that
+value and truncates it to an integer (`static_cast<int>`, not rounded), giving
+`k = 6` instead of 6.93 — and using fewer probes than optimal can only push the
+false-positive rate ABOVE the ~1.00% floor, never below it. 1.234% is
+consistent with `k=6` at 10 bits/key; 0.89% is not achievable by this
+implementation at any `k`. Whatever produced the 0.89% figure, it was not this
+code measured correctly.
+
+This exact figure (1.234377%) was independently reproduced to six significant
+figures by a second Claude agent that ran a bloom-only build from a pristine
+`ff585d5` worktree during the original audit (see `results/21_bloom_ab_reproduce.txt`
+and the "Superseded and third-party files" section above) — so the number is
+not an artifact of this session's particular build.
+
+## On the "298 killed by signal" figure
+
+The crash harness's headline claim — 300/300 rounds passed, zero lost writes —
+is real and reproduced cleanly. The specific sub-count of rounds killed
+mid-operation (vs. between operations) is a different kind of number: it
+depends on exactly when the OS delivers `SIGKILL` relative to the worker's
+write calls, which is a real race even at a fixed RNG seed (the seed controls
+the TARGET kill delay the harness aims for, not the actual scheduling latency
+of signal delivery). This session measured 285; the README states 298. Both
+are real, honest measurements of the same non-deterministic quantity — neither
+is "the" correct number. The README should either state a range from multiple
+runs or drop the specific digit, rather than presenting one run's count as a
+fixed fact.
+
+## What would close the remaining gaps
+
+1. LevelDB comparison: vendor LevelDB (CMake `FetchContent` or a git submodule
+   pinned to a release tag) and run `bench/`'s existing LevelDB adapter
+   back-to-back with `lsm_bench`, 3 runs each, on an idle machine.
+2. CRC32C before/after: add a CMake option to force the software CRC32C path
+   (`-ULSM_HAVE_HARDWARE_CRC32C` or an explicit override macro) and run a
+   read-only workload against both builds.
+3. Flush-dedup before/after and the manifest-bug round count: both require
+   running the harness/benchmark against a pre-fix commit. `git log` for the
+   commits that introduced the flush shadowed-version fix and the manifest
+   ownership fix, check out each in a disposable worktree (not this one, which
+   has another agent's uncommitted work in it), and re-run.
+
+---
+
 # Verified numbers
 
 An audit of resume claims against what the code can actually prove. Every number

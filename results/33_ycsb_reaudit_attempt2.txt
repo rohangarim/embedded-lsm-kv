@@ -1,0 +1,120 @@
+# YCSB re-audit, attempt 2, quieter machine
+# recorded: 2026-09-11T21:21:15Z
+# git: 82d1e5f + working tree
+# conditions: 500000 keys, 500000 ops, 100B values, threads=1, sync=never,
+#             block cache 8 MiB, checksums ON, compression OFF, Zipfian theta=0.99
+
+########## RUN 1  2026-09-11T21:21:15Z
+# load before: 3.33 3.75 3.27
+lsmtree benchmark
+  keys=500000 ops=500000 value_size=100 threads=1 sync=never
+  block_cache=8 MiB compression=none value_entropy=0%
+
+workload            ops      ops/sec  p50 (us)  p95 (us)  p99 (us) p99.9 (us)    max (us)
+--------------------------------------------------------------------------------------------
+load             500000       425711      1.50      2.79      4.92     16.46      6371.8
+A                500000       458272      1.62      3.42      5.00     16.83      7507.6
+B                500000       815480      0.46      2.88      3.58      7.88      5546.1
+C                500000      1080171      0.46      2.62      3.08      6.25       183.7
+D                500000      1137527      0.33      2.58      3.17      6.67      3205.3
+E                500000       132766      6.96     10.50     18.96     67.17      2796.3
+F                500000       368356      2.00      5.21      7.38     26.54      8952.2
+
+engine counters
+  writes                 1074802
+  wal fsyncs             0
+  write groups           1074802 (1.00 writes per group)
+  memtable flushes       40
+  compactions            26
+  compaction in / out    480.7 MiB / 452.4 MiB
+  write amplification    5.59x
+  sstable blocks read    26
+  bloom rejections       0
+  tables probed          1797587
+  block cache hit rate   79.8% (3386285 hits / 856523 misses)
+  block cache evictions  854486
+  block cache resident   8.0 MiB
+  flush versions dropped 285304
+  scan rows returned     24218268
+  scan entries skipped   50279066 (2.1 per row returned)
+
+level shape
+L1: 4 files, 13290 KiB
+L2: 12 files, 46629 KiB
+# load after: 3.71 3.82 3.30
+########## RUN 2  2026-09-11T21:21:24Z
+# load before: 3.71 3.82 3.30
+lsmtree benchmark
+  keys=500000 ops=500000 value_size=100 threads=1 sync=never
+  block_cache=8 MiB compression=none value_entropy=0%
+
+workload            ops      ops/sec  p50 (us)  p95 (us)  p99 (us) p99.9 (us)    max (us)
+--------------------------------------------------------------------------------------------
+load             500000       423793      1.50      2.88      5.46     26.88      5993.8
+A                500000       448429      1.67      3.50      5.46     17.79      4856.8
+B                500000       813056      0.50      2.88      3.62      8.62      5639.6
+C                500000      1079538      0.46      2.58      3.08      6.62        89.8
+D                500000      1094445      0.33      2.67      3.38      8.67      3121.9
+E                500000       145396      6.79      9.21     11.67     19.12      3254.8
+F                500000       374099      1.96      5.17      7.04     17.42      5814.7
+
+engine counters
+  writes                 1074802
+  wal fsyncs             0
+  write groups           1074802 (1.00 writes per group)
+  memtable flushes       40
+  compactions            26
+  compaction in / out    480.7 MiB / 452.4 MiB
+  write amplification    5.59x
+  sstable blocks read    23
+  bloom rejections       0
+  tables probed          1797853
+  block cache hit rate   79.8% (3386374 hits / 856605 misses)
+  block cache evictions  854568
+  block cache resident   8.0 MiB
+  flush versions dropped 285304
+  scan rows returned     24218268
+  scan entries skipped   50279066 (2.1 per row returned)
+
+level shape
+L1: 4 files, 13290 KiB
+L2: 12 files, 46629 KiB
+# load after: 3.44 3.76 3.29
+########## RUN 3  2026-09-11T21:21:33Z
+# load before: 3.44 3.76 3.29
+lsmtree benchmark
+  keys=500000 ops=500000 value_size=100 threads=1 sync=never
+  block_cache=8 MiB compression=none value_entropy=0%
+
+workload            ops      ops/sec  p50 (us)  p95 (us)  p99 (us) p99.9 (us)    max (us)
+--------------------------------------------------------------------------------------------
+load             500000       388234      1.54      3.25      9.50     49.08      7199.3
+A                500000       416485      1.71      3.96      7.42     37.46      7011.2
+B                500000       772472      0.54      3.04      3.96     12.88      5230.9
+C                500000      1034684      0.50      2.71      3.33      9.54       136.7
+D                500000      1041329      0.33      2.71      3.75     14.54      3331.1
+E                500000       144292      6.88      9.17     11.67     22.38      3281.9
+F                500000       375220      1.96      5.12      7.00     22.29      6077.6
+
+engine counters
+  writes                 1074802
+  wal fsyncs             0
+  write groups           1074802 (1.00 writes per group)
+  memtable flushes       40
+  compactions            26
+  compaction in / out    480.7 MiB / 452.4 MiB
+  write amplification    5.59x
+  sstable blocks read    18
+  bloom rejections       0
+  tables probed          1797745
+  block cache hit rate   79.8% (3386223 hits / 856760 misses)
+  block cache evictions  854724
+  block cache resident   8.0 MiB
+  flush versions dropped 285304
+  scan rows returned     24218268
+  scan entries skipped   50279066 (2.1 per row returned)
+
+level shape
+L1: 4 files, 13290 KiB
+L2: 12 files, 46629 KiB
+# load after: 3.06 3.66 3.26

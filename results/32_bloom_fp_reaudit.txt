@@ -1,0 +1,52 @@
+# Bloom FP re-audit on CURRENT tree (bloom.cpp/bloom.h unchanged since last audit)
+# recorded: 2026-09-11T21:20:50Z
+# git: 82d1e5f + working tree
+# command: ./lsm_bloom_ab --db <path> --keys 500000 --hits 200000 --misses 1000000 --bloom-bits 10 --sync never
+
+bloom A/B
+  db=/tmp/lsm_bloom_reaudit keys=500000 value_size=100 bloom_bits_per_key=10
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8563 KiB
+L1: 5 files, 10038 KiB
+L2: 19 files, 38504 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170912
+  READ AMP (blocks/get) 0.854560
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29088 / 170912
+  elapsed               0.398 s  (502586 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   6941
+  READ AMP (blocks/get) 0.006941
+  tables probed         999938
+  bloom rejections      987595
+  bloom pass-through    12343
+  FP RATE               1.234377%
+  block cache hits/miss 5402 / 6941
+  elapsed               0.213 s  (4695392 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   518640
+  READ AMP (blocks/get) 0.432200
+  tables probed         1199955
+  bloom rejections      592574
+  bloom pass-through    607381
+  block cache hits/miss 88741 / 518640
+  elapsed               1.407 s  (852991 lookups/sec)
+  present-key hits      600000 / 600000
