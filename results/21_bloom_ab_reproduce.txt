@@ -1,0 +1,301 @@
+# Bloom A/B reproduction, pristine HEAD ff585d5 + bloom instrumentation only
+# conditions: 500000 keys stored (even indices), 100-byte values, block cache 8 MiB,
+#             checksums ON, compression OFF, threads=1, DB fully compacted before reads
+# absent keys are ODD indices interleaved with stored EVEN indices, so every absent
+# key falls inside a live SSTable key range -- otherwise the range check, not the
+# filter, would do the rejecting and the measurement would be meaningless.
+# load: 3.03 2.48 2.58
+
+########## BLOOM_BITS=10 RUN 1  2026-09-06T02:43:04Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=10
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8563 KiB
+L1: 5 files, 10038 KiB
+L2: 19 files, 38504 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.339 s  (589812 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   6952
+  READ AMP (blocks/get) 0.006952
+  tables probed         999938
+  bloom rejections      987595
+  bloom pass-through    12343
+  FP RATE               1.234377%
+  block cache hits/miss 5391 / 6952
+  elapsed               0.182 s  (5487546 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   518659
+  READ AMP (blocks/get) 0.432216
+  tables probed         1199955
+  bloom rejections      592574
+  bloom pass-through    607381
+  block cache hits/miss 88722 / 518659
+  elapsed               1.116 s  (1074863 lookups/sec)
+  present-key hits      600000 / 600000
+
+########## BLOOM_BITS=10 RUN 2  2026-09-06T02:43:07Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=10
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8563 KiB
+L1: 5 files, 10038 KiB
+L2: 19 files, 38504 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.337 s  (593512 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   6952
+  READ AMP (blocks/get) 0.006952
+  tables probed         999938
+  bloom rejections      987595
+  bloom pass-through    12343
+  FP RATE               1.234377%
+  block cache hits/miss 5391 / 6952
+  elapsed               0.181 s  (5536498 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   518659
+  READ AMP (blocks/get) 0.432216
+  tables probed         1199955
+  bloom rejections      592574
+  bloom pass-through    607381
+  block cache hits/miss 88722 / 518659
+  elapsed               1.140 s  (1052729 lookups/sec)
+  present-key hits      600000 / 600000
+
+########## BLOOM_BITS=10 RUN 3  2026-09-06T02:43:10Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=10
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8563 KiB
+L1: 5 files, 10038 KiB
+L2: 19 files, 38504 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.342 s  (584476 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   6952
+  READ AMP (blocks/get) 0.006952
+  tables probed         999938
+  bloom rejections      987595
+  bloom pass-through    12343
+  FP RATE               1.234377%
+  block cache hits/miss 5391 / 6952
+  elapsed               0.183 s  (5454886 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   518659
+  READ AMP (blocks/get) 0.432216
+  tables probed         1199955
+  bloom rejections      592574
+  bloom pass-through    607381
+  block cache hits/miss 88722 / 518659
+  elapsed               1.145 s  (1047855 lookups/sec)
+  present-key hits      600000 / 600000
+
+########## BLOOM_BITS=0 RUN 1  2026-09-06T02:43:13Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=0
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8471 KiB
+L1: 5 files, 9931 KiB
+L2: 19 files, 38093 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.339 s  (590533 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   853535
+  READ AMP (blocks/get) 0.853535
+  tables probed         999938
+  bloom rejections      0
+  bloom pass-through    999938
+  FP RATE               100.000000%
+  block cache hits/miss 146403 / 853535
+  elapsed               1.703 s  (587231 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   1024279
+  READ AMP (blocks/get) 0.853566
+  tables probed         1199955
+  bloom rejections      0
+  bloom pass-through    1199955
+  block cache hits/miss 175676 / 1024279
+  elapsed               2.010 s  (596987 lookups/sec)
+  present-key hits      600000 / 600000
+
+########## BLOOM_BITS=0 RUN 2  2026-09-06T02:43:19Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=0
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8471 KiB
+L1: 5 files, 9931 KiB
+L2: 19 files, 38093 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.336 s  (594760 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   853535
+  READ AMP (blocks/get) 0.853535
+  tables probed         999938
+  bloom rejections      0
+  bloom pass-through    999938
+  FP RATE               100.000000%
+  block cache hits/miss 146403 / 853535
+  elapsed               1.689 s  (592075 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   1024279
+  READ AMP (blocks/get) 0.853566
+  tables probed         1199955
+  bloom rejections      0
+  bloom pass-through    1199955
+  block cache hits/miss 175676 / 1024279
+  elapsed               2.017 s  (594934 lookups/sec)
+  present-key hits      600000 / 600000
+
+########## BLOOM_BITS=0 RUN 3  2026-09-06T02:43:24Z
+bloom A/B
+  db=/tmp/ab_repro keys=500000 value_size=100 bloom_bits_per_key=0
+  sync_policy=never (load phase only; irrelevant to read metrics)
+  block_cache=8 MiB hits=200000 misses=1000000
+
+level shape after load:
+L0: 3 files, 8471 KiB
+L1: 5 files, 9931 KiB
+L2: 19 files, 38093 KiB
+
+
+[phase 1: 100% present keys (hits)]
+  lookups issued        200000
+  gets counted          200000
+  sstable blocks read   170895
+  READ AMP (blocks/get) 0.854475
+  tables probed         200000
+  bloom rejections      0
+  bloom pass-through    200000
+  block cache hits/miss 29105 / 170895
+  elapsed               0.346 s  (577382 lookups/sec)
+  keys found            200000 / 200000
+
+[phase 2: 100% absent keys (misses)]
+  lookups issued        1000000
+  gets counted          1000000
+  sstable blocks read   853535
+  READ AMP (blocks/get) 0.853535
+  tables probed         999938
+  bloom rejections      0
+  bloom pass-through    999938
+  FP RATE               100.000000%
+  block cache hits/miss 146403 / 853535
+  elapsed               1.732 s  (577383 lookups/sec)
+  keys found            0  (MUST be 0)
+
+[phase 3: 50% present / 50% absent]
+  lookups issued        1200000
+  gets counted          1200000
+  sstable blocks read   1024279
+  READ AMP (blocks/get) 0.853566
+  tables probed         1199955
+  bloom rejections      0
+  bloom pass-through    1199955
+  block cache hits/miss 175676 / 1024279
+  elapsed               2.031 s  (590768 lookups/sec)
+  present-key hits      600000 / 600000
