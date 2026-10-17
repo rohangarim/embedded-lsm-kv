@@ -139,6 +139,47 @@ void BlockReader::Next() {
   ParseEntryAt(next_);
 }
 
+uint32_t BlockReader::RestartCovering(uint32_t offset) const {
+  uint32_t lo = 0, hi = num_restarts_ - 1;
+  while (lo < hi) {
+    const uint32_t mid = lo + (hi - lo + 1) / 2;
+    if (RestartOffset(mid) <= offset) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo;
+}
+
+void BlockReader::SeekToLast() {
+  if (data_ == nullptr) return;
+  SeekToRestart(num_restarts_ - 1);
+  while (valid_ && next_ < entries_size_) Next();
+}
+
+void BlockReader::Prev() {
+  if (!valid_) return;
+  const uint32_t target = current_;
+  if (target == 0) {  // Already at the first entry.
+    valid_ = false;
+    return;
+  }
+
+  // Restart from the last whole key at or before us, then walk forward to the
+  // entry whose successor is where we were.
+  uint32_t restart = RestartCovering(target);
+  if (RestartOffset(restart) == target) {
+    if (restart == 0) {
+      valid_ = false;
+      return;
+    }
+    --restart;
+  }
+  SeekToRestart(restart);
+  while (valid_ && next_ < target) Next();
+}
+
 void BlockReader::Seek(std::string_view target) {
   if (data_ == nullptr) return;
 

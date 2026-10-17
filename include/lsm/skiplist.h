@@ -65,6 +65,22 @@ class SkipList {
     }
     void SeekToFirst() { node_ = list_->head_->Next(0); }
 
+    void SeekToLast() {
+      node_ = list_->FindLast();
+      if (node_ == list_->head_) node_ = nullptr;
+    }
+
+    // Steps backwards. The list has no back pointers -- adding them would mean
+    // a reader could observe a half-linked node, which is exactly what the
+    // single-direction design rules out -- so this searches for the predecessor
+    // instead. That is O(log n) rather than O(1), which is the price of keeping
+    // the read path lock-free.
+    void Prev() {
+      assert(Valid());
+      node_ = list_->FindLessThan(node_->key());
+      if (node_ == list_->head_) node_ = nullptr;
+    }
+
    private:
     const SkipList* list_;
     Node* node_;
@@ -82,6 +98,10 @@ class SkipList {
   // Returns the first node with key >= `key`. If `prev` is non-null, fills
   // prev[i] with the last node visited at level i (the splice points).
   Node* FindGreaterOrEqual(std::string_view key, Node** prev) const;
+  // Last node with a key strictly less than `key`, or head_ if there is none.
+  Node* FindLessThan(std::string_view key) const;
+  // Last node in the list, or head_ when empty.
+  Node* FindLast() const;
 
   Comparator const compare_;
   Arena* const arena_;
@@ -188,6 +208,39 @@ typename SkipList<Comparator>::Node* SkipList<Comparator>::FindGreaterOrEqual(
     } else {
       if (prev != nullptr) prev[level] = x;
       if (level == 0) return next;
+      --level;
+    }
+  }
+}
+
+template <class Comparator>
+typename SkipList<Comparator>::Node* SkipList<Comparator>::FindLessThan(
+    std::string_view key) const {
+  Node* x = head_;
+  int level = max_height_.load(std::memory_order_relaxed) - 1;
+  while (true) {
+    Node* next = x->Next(level);
+    // Descend as soon as the next node would reach or pass the target, so we
+    // end up on the last node strictly before it.
+    if (next != nullptr && compare_(next->key(), key) < 0) {
+      x = next;
+    } else {
+      if (level == 0) return x;
+      --level;
+    }
+  }
+}
+
+template <class Comparator>
+typename SkipList<Comparator>::Node* SkipList<Comparator>::FindLast() const {
+  Node* x = head_;
+  int level = max_height_.load(std::memory_order_relaxed) - 1;
+  while (true) {
+    Node* next = x->Next(level);
+    if (next != nullptr) {
+      x = next;
+    } else {
+      if (level == 0) return x;
       --level;
     }
   }

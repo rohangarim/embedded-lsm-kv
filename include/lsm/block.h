@@ -27,14 +27,24 @@ class BlockReader {
   // use: a malformed restart array is rejected here rather than mid-iteration.
   explicit BlockReader(std::string_view contents);
 
+  // The block bytes are borrowed, so binding to a temporary would leave every
+  // read pointing at freed memory. Making that a compile error rather than a
+  // use-after-free is worth one line.
+  explicit BlockReader(std::string&&) = delete;
+
   bool Valid() const { return valid_; }
   Status status() const { return status_; }
   uint32_t num_restarts() const { return num_restarts_; }
 
   void SeekToFirst();
+  void SeekToLast();
   // Positions at the first entry with key >= target.
   void Seek(std::string_view target);
   void Next();
+  // Steps backwards. An entry's key is only reconstructable by decoding forward
+  // from a restart point, so this re-scans the enclosing restart run rather
+  // than stepping back a record -- there is no way to read one backwards.
+  void Prev();
 
   // Valid() must be true. The key points into an internal buffer that the next
   // Next()/Seek() overwrites; the value points into the block itself.
@@ -47,6 +57,8 @@ class BlockReader {
   // Returns false at the end of the entry region or on a malformed entry.
   bool ParseEntryAt(uint32_t offset);
   void SeekToRestart(uint32_t index);
+  // Index of the last restart point at or before `offset`.
+  uint32_t RestartCovering(uint32_t offset) const;
 
   const char* data_ = nullptr;   // Start of the entry region.
   uint32_t entries_size_ = 0;    // Bytes of entries, excluding the trailer.

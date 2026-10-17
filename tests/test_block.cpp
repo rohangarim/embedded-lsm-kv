@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <random>
 #include <string>
 #include <utility>
@@ -209,6 +210,101 @@ TEST(Block, RepeatedSeeksDoNotLeakPreviousKeyState) {
     reader.Seek(entries[i].first);
     ASSERT_TRUE(reader.Valid()) << i;
     EXPECT_EQ(reader.key(), entries[i].first) << i;
+  }
+}
+
+// Going backwards cannot read an entry in reverse -- a key is only
+// reconstructable by decoding forward from a restart point -- so Prev re-scans
+// the enclosing run. These check it lands where a forward walk says it should.
+TEST(Block, ReverseWalkMatchesForwardWalk) {
+  for (const int interval : {1, 2, 8, 16, 64}) {
+    Entries entries;
+    for (int i = 0; i < 300; ++i) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "key%06d", i);
+      entries.emplace_back(IKey(buf, static_cast<SequenceNumber>(i + 1)),
+                           "v" + std::to_string(i));
+    }
+    const std::string block = Build(entries, interval);
+
+    BlockReader reader(block);
+    Entries backwards;
+    for (reader.SeekToLast(); reader.Valid(); reader.Prev()) {
+      backwards.emplace_back(std::string(reader.key()), std::string(reader.value()));
+    }
+    std::reverse(backwards.begin(), backwards.end());
+    ASSERT_EQ(backwards, entries) << "interval " << interval;
+  }
+}
+
+TEST(Block, SeekToLastFindsTheLastEntry) {
+  for (const int interval : {1, 3, 16}) {
+    for (const int count : {1, 2, 15, 16, 17, 100}) {
+      Entries entries;
+      for (int i = 0; i < count; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "key%06d", i);
+        entries.emplace_back(IKey(buf), "v");
+      }
+      const std::string block = Build(entries, interval);
+      BlockReader reader(block);
+      reader.SeekToLast();
+      ASSERT_TRUE(reader.Valid()) << interval << "/" << count;
+      EXPECT_EQ(reader.key(), entries.back().first) << interval << "/" << count;
+    }
+  }
+}
+
+TEST(Block, PrevFromTheFirstEntryGoesInvalid) {
+  Entries entries = {{IKey("a"), "1"}, {IKey("b"), "2"}};
+  const std::string block = Build(entries, 16);
+  BlockReader reader(block);
+  reader.SeekToFirst();
+  ASSERT_TRUE(reader.Valid());
+  reader.Prev();
+  EXPECT_FALSE(reader.Valid());
+}
+
+TEST(Block, SeekToLastOnAnEmptyBlockIsInvalid) {
+  BlockBuilder builder(16);
+  const std::string block = builder.Finish();
+  BlockReader reader(block);
+  ASSERT_TRUE(reader.status().ok());
+  reader.SeekToLast();
+  EXPECT_FALSE(reader.Valid());
+}
+
+// Alternating directions must not drift: the cursor should land on the same
+// entry it started from.
+TEST(Block, AlternatingNextAndPrevStaysInPlace) {
+  Entries entries;
+  for (int i = 0; i < 200; ++i) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "key%06d", i);
+    entries.emplace_back(IKey(buf), "v" + std::to_string(i));
+  }
+  const std::string block = Build(entries, 8);
+  BlockReader reader(block);
+
+  for (const size_t start : {size_t{0}, size_t{1}, size_t{7}, size_t{8},
+                             size_t{99}, size_t{199}}) {
+    reader.Seek(entries[start].first);
+    ASSERT_TRUE(reader.Valid()) << start;
+    for (int round = 0; round < 5; ++round) {
+      if (start + 1 < entries.size()) {
+        reader.Next();
+        ASSERT_TRUE(reader.Valid()) << start;
+        EXPECT_EQ(reader.key(), entries[start + 1].first) << start;
+        reader.Prev();
+      } else {
+        reader.Prev();
+        ASSERT_TRUE(reader.Valid()) << start;
+        EXPECT_EQ(reader.key(), entries[start - 1].first) << start;
+        reader.Next();
+      }
+      ASSERT_TRUE(reader.Valid()) << start;
+      EXPECT_EQ(reader.key(), entries[start].first) << "start " << start;
+    }
   }
 }
 

@@ -77,7 +77,9 @@ class MemTable {
 
     bool Valid() const { return iter_.Valid(); }
     void SeekToFirst() { iter_.SeekToFirst(); }
+    void SeekToLast() { iter_.SeekToLast(); }
     void Next() { iter_.Next(); }
+    void Prev() { iter_.Prev(); }
     // `target` is an internal key, not a user key.
     void Seek(std::string_view target);
 
