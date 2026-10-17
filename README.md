@@ -39,7 +39,7 @@ for (auto it = db->NewIterator(lsm::ReadOptions()); it->SeekToFirst(), it->Valid
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
-ctest --test-dir build --output-on-failure   # 177 tests
+ctest --test-dir build --output-on-failure   # 195 tests
 ```
 
 ## The idea
@@ -84,7 +84,7 @@ still sit in an older file. Only compaction can drop both together.
 | Write-ahead log | CRC-32C per record, three fsync policies, group commit |
 | SSTables | Data blocks + sparse index + Bloom filter + footer |
 | Data blocks | Prefix compression with restart points |
-| Bloom filters | 0.89% false positives measured at 10 bits/key |
+| Bloom filters | 1.23% false positives measured at 10 bits/key |
 | Block cache | Sharded LRU over decoded blocks |
 | Compaction | Leveled, 7 levels at 10× growth |
 | Snapshots | Pinned read sequence; also gates what compaction may discard |
@@ -131,7 +131,7 @@ rounds across all three fsync policies, and also tears WAL records deliberately.
 RESULT: PASS -- every acknowledged write survived every crash
 ```
 
-Plus 177 unit and integration tests, clean under AddressSanitizer and
+Plus 195 unit and integration tests, clean under AddressSanitizer and
 ThreadSanitizer, all running in CI.
 
 ## Three things worth reading the code for
@@ -163,7 +163,6 @@ the plausible cause.
 - **Scans at 0.62x.** Diagnosed, not a single fixable thing.
 - **Writers serialize.** Group commit shares the fsync, but they still queue
   behind the leader rather than proceeding in parallel.
-- **No reverse iteration.** Forward only; no `Prev` or `SeekToLast`.
 - **Compression costs a third of read throughput**, so it stays off by default.
   A production LZ4 or Snappy would be a drop-in behind the existing interface.
 
