@@ -23,7 +23,17 @@ class VectorIterator : public Iterator {
 
   bool Valid() const override { return index_ < entries_.size(); }
   void SeekToFirst() override { index_ = 0; }
+  void SeekToLast() override {
+    index_ = entries_.empty() ? 0 : entries_.size() - 1;
+  }
   void Next() override { ++index_; }
+  void Prev() override {
+    if (index_ == 0) {
+      index_ = entries_.size();  // Before-the-beginning: invalid, like Next().
+    } else {
+      --index_;
+    }
+  }
   void Seek(std::string_view target) override {
     index_ = 0;
     while (index_ < entries_.size() &&
@@ -255,6 +265,138 @@ TEST(MergingIterator, ScalesToManyChildren) {
   for (int i = 0; i < 200; ++i) {
     EXPECT_EQ(ExtractUserKey(got[i].first), Key(i)) << i;
   }
+}
+
+// Collects everything a full backward walk yields, oldest call site to the
+// caller's mind but newest-key-first on the wire -- same shape as Drain, the
+// other direction.
+Entries DrainReverse(Iterator* iter) {
+  Entries out;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    out.emplace_back(std::string(iter->key()), std::string(iter->value()));
+  }
+  return out;
+}
+
+TEST(MergingIterator, SeekToLastOnNoChildrenIsInvalid) {
+  auto merged = NewMergingIterator({});
+  merged->SeekToLast();
+  EXPECT_FALSE(merged->Valid());
+}
+
+TEST(MergingIterator, ReverseWalkIsTheForwardWalkBackwards) {
+  std::vector<std::unique_ptr<Iterator>> children;
+  for (int c = 0; c < 4; ++c) {
+    Entries entries;
+    for (int i = c; i < 200; i += 4) {
+      entries.emplace_back(EncodeInternalKey(Key(i), 1, ValueType::kValue),
+                           "v" + std::to_string(i));
+    }
+    children.push_back(Child(std::move(entries)));
+  }
+  // Rebuild the same children for the forward pass -- the merge consumes them.
+  std::vector<std::unique_ptr<Iterator>> children2;
+  for (int c = 0; c < 4; ++c) {
+    Entries entries;
+    for (int i = c; i < 200; i += 4) {
+      entries.emplace_back(EncodeInternalKey(Key(i), 1, ValueType::kValue),
+                           "v" + std::to_string(i));
+    }
+    children2.push_back(Child(std::move(entries)));
+  }
+
+  auto forward = NewMergingIterator(std::move(children2));
+  Entries expected = Drain(forward.get());
+  std::reverse(expected.begin(), expected.end());
+
+  auto merged = NewMergingIterator(std::move(children));
+  const Entries got = DrainReverse(merged.get());
+
+  ASSERT_EQ(got, expected);
+}
+
+// A raw reverse walk is just the forward walk backwards: forward is
+// newest-sequence-first for a given user key, so backward is oldest first.
+// (Collapsing to "newest visible version only" is DBIter's job, layered on
+// top of this -- the merge itself does not do it.)
+TEST(MergingIterator, ReverseEqualUserKeysComeOutOldestFirst) {
+  std::vector<std::unique_ptr<Iterator>> children;
+  children.push_back(Child({{EncodeInternalKey("k", 5, ValueType::kValue), "v5"}}));
+  children.push_back(Child({{EncodeInternalKey("k", 9, ValueType::kValue), "v9"}}));
+  children.push_back(Child({{EncodeInternalKey("k", 1, ValueType::kValue), "v1"}}));
+
+  auto merged = NewMergingIterator(std::move(children));
+  const Entries got = DrainReverse(merged.get());
+
+  ASSERT_EQ(got.size(), 3u);
+  EXPECT_EQ(got[0].second, "v1");
+  EXPECT_EQ(got[1].second, "v5");
+  EXPECT_EQ(got[2].second, "v9");
+}
+
+// The case the direction-switch logic exists for: reverse a bit, then go
+// forward again, and the stream must pick up exactly where a pure forward
+// walk would have been -- no repeated and no skipped entries.
+TEST(MergingIterator, ReversingThenForwardResumesCleanly) {
+  std::vector<std::unique_ptr<Iterator>> children;
+  for (int c = 0; c < 3; ++c) {
+    Entries entries;
+    for (int i = c; i < 60; i += 3) {
+      entries.emplace_back(EncodeInternalKey(Key(i), 1, ValueType::kValue),
+                           "v" + std::to_string(i));
+    }
+    children.push_back(Child(std::move(entries)));
+  }
+  auto merged = NewMergingIterator(std::move(children));
+
+  merged->SeekToFirst();
+  for (int i = 0; i < 30; ++i) merged->Next();  // Walk to key 30.
+  ASSERT_TRUE(merged->Valid());
+  ASSERT_EQ(ExtractUserKey(merged->key()), Key(30));
+
+  for (int i = 0; i < 10; ++i) merged->Prev();  // Back to key 20.
+  ASSERT_TRUE(merged->Valid());
+  ASSERT_EQ(ExtractUserKey(merged->key()), Key(20));
+
+  // Forward again: must retrace 20, 21, ..., 59 with nothing missing or
+  // repeated, exactly as an uninterrupted forward walk would have.
+  for (int expected = 20; expected < 60; ++expected) {
+    ASSERT_TRUE(merged->Valid()) << expected;
+    ASSERT_EQ(ExtractUserKey(merged->key()), Key(expected));
+    merged->Next();
+  }
+  EXPECT_FALSE(merged->Valid());
+}
+
+// And the mirror: forward a bit, reverse past the start, and switching back
+// to forward must reproduce the same run instead of repeating or dropping
+// what reverse already walked over.
+TEST(MergingIterator, ForwardAfterReversingToTheStartResumesCleanly) {
+  std::vector<std::unique_ptr<Iterator>> children;
+  for (int c = 0; c < 3; ++c) {
+    Entries entries;
+    for (int i = c; i < 30; i += 3) {
+      entries.emplace_back(EncodeInternalKey(Key(i), 1, ValueType::kValue),
+                           "v" + std::to_string(i));
+    }
+    children.push_back(Child(std::move(entries)));
+  }
+  auto merged = NewMergingIterator(std::move(children));
+
+  merged->SeekToFirst();
+  for (int i = 0; i < 5; ++i) merged->Next();  // Walk to key 5.
+  ASSERT_EQ(ExtractUserKey(merged->key()), Key(5));
+
+  for (int i = 0; i < 6; ++i) merged->Prev();  // 5,4,3,2,1,0, then off the front.
+  EXPECT_FALSE(merged->Valid());
+
+  merged->SeekToFirst();  // Next()/Prev() require Valid(); re-seek to recover.
+  int expected = 0;
+  for (; merged->Valid(); merged->Next()) {
+    ASSERT_EQ(ExtractUserKey(merged->key()), Key(expected)) << expected;
+    ++expected;
+  }
+  EXPECT_EQ(expected, 30);
 }
 
 }  // namespace lsm

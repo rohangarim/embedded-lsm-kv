@@ -1377,8 +1377,10 @@ class MemTableIteratorAdapter : public Iterator {
 
   bool Valid() const override { return iter_.Valid(); }
   void SeekToFirst() override { iter_.SeekToFirst(); }
+  void SeekToLast() override { iter_.SeekToLast(); }
   void Seek(std::string_view target) override { iter_.Seek(target); }
   void Next() override { iter_.Next(); }
+  void Prev() override { iter_.Prev(); }
   std::string_view key() const override { return iter_.internal_key(); }
   std::string_view value() const override { return iter_.value(); }
 
@@ -1413,6 +1415,15 @@ class LevelIterator : public Iterator {
     SkipEmptyFilesForward();
   }
 
+  void SeekToLast() override {
+    // Underflows to SIZE_MAX when the level is empty, which is harmless:
+    // OpenCurrentFile's bounds check makes iter_ null either way.
+    index_ = files_.size() - 1;
+    OpenCurrentFile();
+    if (iter_ != nullptr) iter_->SeekToLast();
+    SkipEmptyFilesBackward();
+  }
+
   void Seek(std::string_view target) override {
     // First file whose largest key is >= target: the only one that can contain
     // it, and the right place to start scanning from.
@@ -1434,6 +1445,11 @@ class LevelIterator : public Iterator {
   void Next() override {
     iter_->Next();
     SkipEmptyFilesForward();
+  }
+
+  void Prev() override {
+    iter_->Prev();
+    SkipEmptyFilesBackward();
   }
 
   std::string_view key() const override { return iter_->key(); }
@@ -1459,6 +1475,24 @@ class LevelIterator : public Iterator {
       ++index_;
       OpenCurrentFile();
       if (iter_ != nullptr) iter_->SeekToFirst();
+    }
+  }
+
+  // Mirror image, walking toward index 0. index_ is unsigned, so the "ran out
+  // of files" case is caught explicitly rather than by letting it underflow.
+  void SkipEmptyFilesBackward() {
+    while (iter_ != nullptr && !iter_->Valid()) {
+      if (!iter_->status().ok()) {
+        status_ = iter_->status();
+        return;
+      }
+      if (index_ == 0) {
+        iter_ = nullptr;
+        return;
+      }
+      --index_;
+      OpenCurrentFile();
+      if (iter_ != nullptr) iter_->SeekToLast();
     }
   }
 
@@ -1490,23 +1524,54 @@ class DBIter : public Iterator {
   bool Valid() const override { return valid_; }
 
   void SeekToFirst() override {
+    direction_ = kForward;
     inner_->SeekToFirst();
     AdvanceToNextLiveKey();
   }
 
+  void SeekToLast() override {
+    direction_ = kReverse;
+    inner_->SeekToLast();
+    FindPrevLiveKey();
+  }
+
   void Seek(std::string_view target) override {
+    direction_ = kForward;
     const LookupKeyBuffer lookup(target, seq_);
     inner_->Seek(lookup.key());
     AdvanceToNextLiveKey();
   }
 
   void Next() override {
+    if (direction_ == kReverse) {
+      // inner_ sits one entry before this key's run (the boundary Prev found
+      // it at). Step forward into the run so the normal skip-then-advance
+      // logic below can take over as if we'd arrived here going forward.
+      if (!inner_->Valid()) {
+        inner_->SeekToFirst();
+      } else {
+        inner_->Next();
+      }
+      direction_ = kForward;
+    }
     SkipRestOfCurrentKey();
     AdvanceToNextLiveKey();
   }
 
+  void Prev() override {
+    if (direction_ == kForward) {
+      // inner_ sits exactly on the version this iterator last returned. Step
+      // back once so the reverse scan doesn't immediately re-examine it.
+      inner_->Prev();
+      direction_ = kReverse;
+    }
+    FindPrevLiveKey();
+  }
+
   std::string_view key() const override { return key_; }
-  std::string_view value() const override { return value_; }
+  std::string_view value() const override {
+    return direction_ == kForward ? value_ : std::string_view(saved_value_);
+  }
   Status status() const override { return inner_->status(); }
 
  private:
@@ -1542,6 +1607,52 @@ class DBIter : public Iterator {
     valid_ = false;
   }
 
+  // Reverse counterpart of AdvanceToNextLiveKey. The complication: a key's
+  // versions run newest-first in forward order, so walking backward visits
+  // them oldest-first -- the newest visible one, which is what a reader
+  // wants, is the *last* one this scan will see for the run, not the first.
+  // So this can't return as soon as it finds a visible entry the way the
+  // forward path does; it has to keep walking the run, keeping the latest
+  // visible version seen so far, until either the run ends (key changes) or
+  // inner_ runs out. Ownership follows from that: value_ is normally a view
+  // into inner_ because inner_ stays put after a forward step, but here
+  // inner_ keeps moving after each candidate is recorded, so the candidate
+  // has to be copied into saved_value_ to survive.
+  void FindPrevLiveKey() {
+    bool have_value = false;
+    while (inner_->Valid()) {
+      const std::string_view ikey = inner_->key();
+      if (ExtractSequence(ikey) <= seq_) {  // Visible in this snapshot.
+        const std::string_view user_key = ExtractUserKey(ikey);
+        if (have_value && user_key < key_) {
+          // Crossed into an older key's run with a live value already saved
+          // for key_ -- stop, leaving inner_ positioned on this entry so the
+          // next Prev() or Next() resumes from exactly here.
+          break;
+        }
+        if (ExtractValueType(ikey) == ValueType::kDeletion) {
+          have_value = false;
+          key_.clear();
+        } else {
+          key_.assign(user_key);
+          saved_value_.assign(inner_->value());
+          have_value = true;
+        }
+      }
+      inner_->Prev();
+      ++skipped_count_;
+    }
+
+    if (have_value) {
+      valid_ = true;
+      --skipped_count_;  // The entry that won gets returned, not skipped.
+      ++returned_count_;
+    } else {
+      valid_ = false;
+      key_.clear();
+    }
+  }
+
   std::unique_ptr<Iterator> inner_;
   SequenceNumber seq_;
   std::shared_ptr<const Version> version_;  // Keeps the referenced tables alive.
@@ -1556,7 +1667,12 @@ class DBIter : public Iterator {
   // bytes it fits in the small-string buffer and costs no allocation.
   std::string key_;
   std::string_view value_;
+  // Reverse-only: owned copy of the current entry's value. See
+  // FindPrevLiveKey for why a view isn't enough going backward.
+  std::string saved_value_;
   bool valid_ = false;
+  enum Direction { kForward, kReverse };
+  Direction direction_ = kForward;
 };
 
 }  // namespace

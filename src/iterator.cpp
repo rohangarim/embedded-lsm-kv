@@ -1,6 +1,7 @@
 #include "lsm/iterator.h"
 
 #include <cassert>
+#include <string>
 #include <utility>
 
 #include "lsm/internal_key.h"
@@ -26,20 +27,53 @@ class MergingIterator : public Iterator {
     heap_.reserve(children_.size());
   }
 
-  bool Valid() const override { return !heap_.empty(); }
+  bool Valid() const override {
+    return direction_ == kForward ? !heap_.empty() : current_ < children_.size();
+  }
 
   void SeekToFirst() override {
     for (auto& child : children_) child->SeekToFirst();
+    direction_ = kForward;
     BuildHeap();
+  }
+
+  void SeekToLast() override {
+    for (auto& child : children_) child->SeekToLast();
+    direction_ = kReverse;
+    FindLargest();
   }
 
   void Seek(std::string_view target) override {
     for (auto& child : children_) child->Seek(target);
+    direction_ = kForward;
     BuildHeap();
   }
 
   void Next() override {
     assert(Valid());
+    if (direction_ != kForward) {
+      // Every child but the current one is left over from reverse iteration,
+      // positioned at or before key(). Bring each one to just past it so the
+      // heap's invariant -- no child positioned earlier than what was last
+      // reported -- holds again.
+      const std::string saved_key(key());
+      const size_t current = current_;
+      for (size_t i = 0; i < children_.size(); ++i) {
+        if (i == current) continue;
+        Iterator* child = children_[i].get();
+        child->Seek(saved_key);
+        if (child->Valid() && CompareInternalKey(child->key(), saved_key) == 0) {
+          child->Next();
+        }
+      }
+      // The current child is still sitting on saved_key too -- it must move
+      // past it like every other child did, or the very next entry reported
+      // would be a duplicate of the one already returned.
+      children_[current].get()->Next();
+      direction_ = kForward;
+      BuildHeap();
+      return;
+    }
     Iterator* top = children_[heap_.front()].get();
     top->Next();
     if (top->Valid()) {
@@ -52,14 +86,46 @@ class MergingIterator : public Iterator {
     }
   }
 
+  void Prev() override {
+    assert(Valid());
+    if (direction_ != kReverse) {
+      // Mirror image of the forward switch: bring every other child to just
+      // before key(), so the next linear scan for the largest key is correct.
+      const std::string saved_key(key());
+      const size_t current = heap_.front();
+      for (size_t i = 0; i < children_.size(); ++i) {
+        if (i == current) continue;
+        Iterator* child = children_[i].get();
+        child->Seek(saved_key);
+        if (child->Valid()) {
+          child->Prev();
+        } else {
+          child->SeekToLast();
+        }
+      }
+      // Same reasoning as the forward switch, mirrored: the current child is
+      // still on saved_key and has to move off it too, or FindLargest below
+      // would just find saved_key again.
+      children_[current].get()->Prev();
+      current_ = current;
+      direction_ = kReverse;
+      FindLargest();
+      return;
+    }
+    children_[current_]->Prev();
+    FindLargest();
+  }
+
   std::string_view key() const override {
     assert(Valid());
-    return children_[heap_.front()]->key();
+    return direction_ == kForward ? children_[heap_.front()]->key()
+                                  : children_[current_]->key();
   }
 
   std::string_view value() const override {
     assert(Valid());
-    return children_[heap_.front()]->value();
+    return direction_ == kForward ? children_[heap_.front()]->value()
+                                  : children_[current_]->value();
   }
 
   Status status() const override {
@@ -106,10 +172,33 @@ class MergingIterator : public Iterator {
     heap_[pos] = slot;
   }
 
+  // Reverse iteration is rare next to the compaction/scan path the heap is
+  // tuned for, so it falls back to a plain linear scan for whichever child
+  // holds the largest key -- no heap maintenance, just current_ updated in
+  // place.
+  void FindLargest() {
+    current_ = children_.size();
+    for (size_t i = 0; i < children_.size(); ++i) {
+      if (!children_[i]->Valid()) continue;
+      if (current_ == children_.size()) {
+        current_ = i;
+        continue;
+      }
+      // Ties keep the lower index, matching Greater()'s forward tie rule.
+      if (CompareInternalKey(children_[i]->key(), children_[current_]->key()) > 0) {
+        current_ = i;
+      }
+    }
+  }
+
   std::vector<std::unique_ptr<Iterator>> children_;
   // Indices into children_, arranged as a min-heap by current key. Children
-  // that have run out are simply absent.
+  // that have run out are simply absent. Only meaningful in kForward.
   std::vector<size_t> heap_;
+  enum Direction { kForward, kReverse };
+  Direction direction_ = kForward;
+  // Index of the child holding the largest key. Only meaningful in kReverse.
+  size_t current_ = 0;
 };
 
 }  // namespace

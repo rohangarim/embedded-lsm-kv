@@ -17,8 +17,10 @@ class Iterator {
 
   virtual bool Valid() const = 0;
   virtual void SeekToFirst() = 0;
+  virtual void SeekToLast() = 0;
   virtual void Seek(std::string_view target) = 0;
   virtual void Next() = 0;
+  virtual void Prev() = 0;
 
   // Valid() must be true.
   virtual std::string_view key() const = 0;

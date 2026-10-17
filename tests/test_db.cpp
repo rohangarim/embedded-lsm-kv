@@ -252,6 +252,139 @@ TEST(DB, IteratorScansLiveKeysInOrder) {
   EXPECT_TRUE(iter->status().ok());
 }
 
+TEST(DB, IteratorScansLiveKeysInReverseOrder) {
+  ScopedTempDir dir("db_iter_reverse");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  constexpr int kKeys = 3000;
+  for (const int i : testing_support::ShuffledRange(kKeys, 5)) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  ASSERT_TRUE(db->FlushMemTable().ok());
+  for (int i = 0; i < kKeys; i += 3) {
+    ASSERT_TRUE(db->Delete(WriteOptions(), Key(i)).ok());
+  }
+  // Spread the rest across levels too, not just L0 -- this is meant to
+  // exercise LevelIterator's reverse path, not only the memtable's.
+  ASSERT_TRUE(db->CompactAll().ok());
+
+  auto iter = db->NewIterator(ReadOptions());
+  int expected = kKeys - 1;
+  int seen = 0;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    while (expected % 3 == 0) --expected;  // Skip the keys we deleted.
+    ASSERT_EQ(iter->key(), Key(expected)) << "at position " << seen;
+    EXPECT_EQ(iter->value(), Value(expected));
+    --expected;
+    ++seen;
+  }
+  EXPECT_EQ(seen, kKeys - (kKeys + 2) / 3);
+  EXPECT_TRUE(iter->status().ok());
+}
+
+TEST(DB, IteratorOverEmptyDatabaseInReverse) {
+  ScopedTempDir dir("db_iter_empty_reverse");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+  auto iter = db->NewIterator(ReadOptions());
+  iter->SeekToLast();
+  EXPECT_FALSE(iter->Valid());
+}
+
+// Only the newest visible version of a key should ever come back, walking
+// backward same as forward -- this is what exercises DBIter::FindPrevLiveKey
+// actually collapsing a run of versions rather than just reversing raw
+// internal-key order the way the merge underneath it does.
+TEST(DB, ReverseIteratorCollapsesToTheNewestVersion) {
+  ScopedTempDir dir("db_iter_reverse_versions");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  for (int round = 0; round < 20; ++round) {
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i + round * 1000)).ok());
+    }
+  }
+  ASSERT_TRUE(db->FlushMemTable().ok());
+
+  auto iter = db->NewIterator(ReadOptions());
+  int expected = 199;
+  int seen = 0;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    ASSERT_EQ(iter->key(), Key(expected)) << "at position " << seen;
+    EXPECT_EQ(iter->value(), Value(expected + 19 * 1000));
+    --expected;
+    ++seen;
+  }
+  EXPECT_EQ(seen, 200);
+}
+
+// Switches direction mid-scan and checks it lands exactly where a pure
+// walk in the new direction would have -- the case the DBIter/MergingIterator
+// direction-switch logic exists for.
+TEST(DB, IteratorCanReverseMidScanAndResumeForward) {
+  ScopedTempDir dir("db_iter_reverse_midscan");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  constexpr int kKeys = 500;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  ASSERT_TRUE(db->CompactAll().ok());
+
+  auto iter = db->NewIterator(ReadOptions());
+  iter->SeekToFirst();
+  for (int i = 0; i < 300; ++i) iter->Next();  // At key 300.
+  ASSERT_EQ(iter->key(), Key(300));
+
+  for (int i = 0; i < 50; ++i) iter->Prev();  // Back to key 250.
+  ASSERT_EQ(iter->key(), Key(250));
+
+  for (int expected = 250; expected < kKeys; ++expected) {
+    ASSERT_TRUE(iter->Valid()) << expected;
+    EXPECT_EQ(iter->key(), Key(expected));
+    EXPECT_EQ(iter->value(), Value(expected));
+    iter->Next();
+  }
+  EXPECT_FALSE(iter->Valid());
+}
+
+// Same guarantee as the forward snapshot test, in reverse: a snapshot must
+// keep seeing its own state walking backward, even after later writes and a
+// compaction try to collapse the versions it depends on.
+TEST(DB, SnapshotReverseIteratorSeesItsOwnState) {
+  ScopedTempDir dir("db_iter_reverse_snapshot");
+  auto db = OpenDB(dir.File("db"), SmallOptions());
+
+  constexpr int kKeys = 300;
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  const Snapshot* snapshot = db->GetSnapshot();
+
+  for (int i = 0; i < kKeys; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i + 900000)).ok());
+  }
+  for (int i = 0; i < kKeys; i += 2) {
+    ASSERT_TRUE(db->Delete(WriteOptions(), Key(i)).ok());
+  }
+  ASSERT_TRUE(db->CompactAll().ok());
+
+  ReadOptions options;
+  options.snapshot = snapshot;
+  auto iter = db->NewIterator(options);
+  int expected = kKeys - 1;
+  int rows = 0;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    ASSERT_EQ(iter->key(), Key(expected)) << expected;
+    EXPECT_EQ(iter->value(), Value(expected));
+    --expected;
+    ++rows;
+  }
+  EXPECT_EQ(rows, kKeys) << "snapshot reverse scan should see every original key";
+  EXPECT_TRUE(iter->status().ok());
+
+  db->ReleaseSnapshot(snapshot);
+}
+
 TEST(DB, IteratorSeekPositionsCorrectly) {
   ScopedTempDir dir("db_iter_seek");
   auto db = OpenDB(dir.File("db"), SmallOptions());

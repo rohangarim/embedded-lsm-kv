@@ -181,6 +181,69 @@ TEST(SSTable, IteratorWalksEveryEntryInOrder) {
   EXPECT_TRUE(iter->status().ok());
 }
 
+TEST(SSTable, IteratorWalksEveryEntryInReverseOrder) {
+  testing_support::ScopedTempDir dir("sst_iter_reverse");
+  Options options;
+  options.block_size_bytes = 512;  // Force many blocks, so this crosses them.
+  auto table = BuildTable(dir.File("000001.sst"), 3000, options);
+  ASSERT_GT(table->num_data_blocks(), 100u);
+
+  auto iter = table->NewIterator();
+  int count = 0;
+  std::string previous;
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    const std::string key(iter->key());
+    if (count > 0) ASSERT_GT(CompareInternalKey(previous, key), 0);
+    const int index = 2999 - count;
+    EXPECT_EQ(ExtractUserKey(key), testing_support::Key(index));
+    EXPECT_EQ(iter->value(), testing_support::Value(index));
+    previous = key;
+    ++count;
+  }
+  EXPECT_EQ(count, 3000);
+  EXPECT_TRUE(iter->status().ok());
+}
+
+TEST(SSTable, SeekToLastOnAnEmptyTableIsInvalid) {
+  testing_support::ScopedTempDir dir("sst_empty_reverse");
+  Options options;
+  const std::string path = dir.File("000001.sst");
+
+  TableBuilder builder(options);
+  ASSERT_TRUE(builder.Open(path).ok());
+  ASSERT_TRUE(builder.Finish().ok());
+
+  std::unique_ptr<Table> table;
+  ASSERT_TRUE(Table::Open(path, options, &table).ok());
+
+  auto iter = table->NewIterator();
+  iter->SeekToLast();
+  EXPECT_FALSE(iter->Valid());
+}
+
+// Alternating direction must retrace the same entries, not skip or repeat
+// one at a block boundary -- exactly the spot RestartCovering has to get right.
+TEST(SSTable, AlternatingNextAndPrevStaysInPlace) {
+  testing_support::ScopedTempDir dir("sst_alternate");
+  Options options;
+  options.block_size_bytes = 512;
+  auto table = BuildTable(dir.File("000001.sst"), 500, options);
+
+  auto iter = table->NewIterator();
+  iter->SeekToFirst();
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(iter->Valid()) << i;
+    EXPECT_EQ(ExtractUserKey(iter->key()), testing_support::Key(i)) << i;
+    iter->Next();
+    if (iter->Valid()) {
+      iter->Prev();
+      ASSERT_TRUE(iter->Valid()) << i;
+      EXPECT_EQ(ExtractUserKey(iter->key()), testing_support::Key(i)) << i;
+      iter->Next();
+    }
+  }
+}
+
 TEST(SSTable, IteratorSeekCrossesBlockBoundaries) {
   testing_support::ScopedTempDir dir("sst_seek");
   Options options;

@@ -425,6 +425,15 @@ class TableIterator : public Iterator {
     LoadBlock(nullptr);  // Also positions at the block's first entry.
   }
 
+  void SeekToLast() override {
+    if (table_->index_.empty()) {
+      valid_ = false;
+      return;
+    }
+    block_index_ = table_->index_.size() - 1;
+    LoadBlockFromEnd();
+  }
+
   void Seek(std::string_view target) override {
     size_t lo = 0, hi = table_->index_.size();
     while (lo < hi) {
@@ -450,6 +459,23 @@ class TableIterator : public Iterator {
     }
     ++block_index_;
     LoadBlock(nullptr);
+  }
+
+  void Prev() override {
+    if (!valid_) return;
+    reader_.Prev();
+    if (reader_.Valid()) return;
+    if (!reader_.status().ok()) {
+      status_ = reader_.status();
+      valid_ = false;
+      return;
+    }
+    if (block_index_ == 0) {
+      valid_ = false;
+      return;
+    }
+    --block_index_;
+    LoadBlockFromEnd();
   }
 
   std::string_view key() const override { return reader_.key(); }
@@ -492,6 +518,40 @@ class TableIterator : public Iterator {
       ++block_index_;
     }
     valid_ = false;
+  }
+
+  // Opens block_index_ and positions the cursor at its last entry, skipping
+  // backward over any empty block. Mirrors LoadBlock, walking the other way.
+  void LoadBlockFromEnd() {
+    while (true) {
+      status_ = table_->ReadBlock(table_->index_[block_index_].offset,
+                                  table_->index_[block_index_].size, &block_);
+      if (!status_.ok()) {
+        valid_ = false;
+        return;
+      }
+      reader_ = BlockReader(*block_);
+      if (!reader_.status().ok()) {
+        status_ = reader_.status();
+        valid_ = false;
+        return;
+      }
+      reader_.SeekToLast();
+      if (!reader_.status().ok()) {
+        status_ = reader_.status();
+        valid_ = false;
+        return;
+      }
+      if (reader_.Valid()) {
+        valid_ = true;
+        return;
+      }
+      if (block_index_ == 0) {
+        valid_ = false;
+        return;
+      }
+      --block_index_;
+    }
   }
 
   const Table* table_;
