@@ -39,7 +39,7 @@ for (auto it = db->NewIterator(lsm::ReadOptions()); it->SeekToFirst(), it->Valid
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
-ctest --test-dir build --output-on-failure   # 195 tests
+ctest --test-dir build --output-on-failure   # 197 tests
 ```
 
 ## The idea
@@ -86,7 +86,7 @@ still sit in an older file. Only compaction can drop both together.
 | Data blocks | Prefix compression with restart points |
 | Bloom filters | 1.23% false positives measured at 10 bits/key |
 | Block cache | Sharded LRU over decoded blocks |
-| Compaction | Leveled, 7 levels at 10× growth |
+| Compaction | Leveled, 7 levels at 10× growth, with L0 write backpressure |
 | Snapshots | Pinned read sequence; also gates what compaction may discard |
 | Manifest | Append-only edit log, ~115 bytes per commit regardless of database size |
 | Compression | Optional, off by default — built-in LZ77 or zlib |
@@ -131,7 +131,7 @@ rounds across all three fsync policies, and also tears WAL records deliberately.
 RESULT: PASS -- every acknowledged write survived every crash
 ```
 
-Plus 195 unit and integration tests, clean under AddressSanitizer and
+Plus 197 unit and integration tests, clean under AddressSanitizer and
 ThreadSanitizer, all running in CI.
 
 ## Three things worth reading the code for
