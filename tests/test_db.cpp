@@ -543,4 +543,45 @@ TEST(DB, BackgroundCompactionKeepsDataCorrect) {
   }
 }
 
+// With the backpressure triggers set low, a heavy write burst has to be slowed
+// or stopped while compaction catches up -- and must still finish with every
+// key intact.
+TEST(DB, WriteBackpressureKeepsLevelZeroBoundedAndDataIntact) {
+  ScopedTempDir dir("db_backpressure");
+  Options options = SmallOptions();
+  options.background_compaction = true;
+  options.memtable_size_bytes = 16 * 1024;
+  options.l0_compaction_trigger = 2;
+  options.l0_slowdown_trigger = 3;
+  options.l0_stop_trigger = 5;
+  auto db = OpenDB(dir.File("db"), options);
+
+  for (int i = 0; i < 10000; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  db->WaitForBackgroundWork();
+  for (int i = 0; i < 10000; i += 7) {
+    EXPECT_EQ(MustGet(db.get(), Key(i)), Value(i)) << i;
+  }
+  EXPECT_GT(db->GetStats().write_stalls, 0U) << "the burst never hit the triggers";
+}
+
+// A stop trigger at or below the compaction trigger would wait on compaction
+// that is never scheduled. It must be clamped rather than deadlock.
+TEST(DB, MisconfiguredStopTriggerDoesNotDeadlock) {
+  ScopedTempDir dir("db_backpressure_bad");
+  Options options = SmallOptions();
+  options.background_compaction = true;
+  options.memtable_size_bytes = 16 * 1024;
+  options.l0_compaction_trigger = 4;
+  options.l0_slowdown_trigger = 100;
+  options.l0_stop_trigger = 1;
+  auto db = OpenDB(dir.File("db"), options);
+  for (int i = 0; i < 6000; ++i) {
+    ASSERT_TRUE(db->Put(WriteOptions(), Key(i), Value(i)).ok());
+  }
+  db->WaitForBackgroundWork();
+  EXPECT_EQ(MustGet(db.get(), Key(5999)), Value(5999));
+}
+
 }  // namespace lsm

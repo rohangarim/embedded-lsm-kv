@@ -56,6 +56,14 @@ struct Options {
   // every one of them. Compact once L0 reaches this many files.
   int l0_compaction_trigger = 4;
 
+  // Backpressure when compaction falls behind. At the slowdown trigger each
+  // write is delayed by a millisecond, giving compaction CPU and disk without
+  // stopping anyone; at the stop trigger writes block until L0 drains. Only
+  // applies with background_compaction on -- inline compaction already runs
+  // to completion before a write proceeds.
+  int l0_slowdown_trigger = 8;
+  int l0_stop_trigger = 12;
+
   // Byte budget of level 1. Each deeper level is 10x larger.
   uint64_t max_bytes_for_level_base = 10u << 20;  // 10 MiB
 

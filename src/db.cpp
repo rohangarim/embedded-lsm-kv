@@ -11,6 +11,7 @@
 #include <cstring>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "lsm/coding.h"
 #include "lsm/crc32c.h"
@@ -782,8 +783,40 @@ Status DB::Delete(const WriteOptions& opts, std::string_view key) {
 }
 
 Status DB::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
+  bool delayed = false;
   while (true) {
     if (!bg_error_.ok()) return bg_error_;
+    if (options_.background_compaction) {
+      const size_t l0_files = current_->levels[0].size();
+      // Whatever the configuration says, stopping below the compaction trigger
+      // would wait on work that never gets scheduled.
+      const size_t stop_at = static_cast<size_t>(
+          std::max(options_.l0_stop_trigger, options_.l0_compaction_trigger + 1));
+      if (l0_files >= stop_at) {
+        // Too many overlapping files: every read is paying for them. Wait for
+        // compaction to make progress rather than digging the hole deeper.
+        const auto stall_start = std::chrono::steady_clock::now();
+        MaybeScheduleCompaction();
+        bg_cv_.wait(lock);
+        ++stats_.write_stalls;
+        stats_.write_stall_micros += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - stall_start)
+                .count());
+        continue;
+      }
+      if (!delayed && l0_files >= static_cast<size_t>(options_.l0_slowdown_trigger)) {
+        // Once per write, and with the lock released so readers and the
+        // compaction thread are not held up by the delay itself.
+        delayed = true;
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+        ++stats_.write_stalls;
+        stats_.write_stall_micros += 1000;
+        continue;
+      }
+    }
     if (mem_->ApproximateMemoryUsage() <= options_.memtable_size_bytes) {
       return Status::OK();
     }
