@@ -73,8 +73,9 @@ TEST(Manifest, CommitCostDoesNotGrowWithTheDatabase) {
       static_cast<double>(stats.manifest_bytes_written - bytes_early) /
       static_cast<double>(stats.manifest_commits - commits_early);
 
-  std::printf("[manifest] bytes/commit: %.0f early, %.0f late (%zu files)\n",
-              early_per_commit, late_per_commit, db->GetStats().manifest_commits);
+  std::printf("[manifest] bytes/commit: %.0f early, %.0f late (%llu files)\n",
+              early_per_commit, late_per_commit,
+              static_cast<unsigned long long>(db->GetStats().manifest_commits));
 
   // With a full rewrite per commit this ratio would climb with the file count.
   EXPECT_LT(late_per_commit, early_per_commit * 4.0);
