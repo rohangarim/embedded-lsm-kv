@@ -790,12 +790,18 @@ Status DB::MakeRoomForWrite(std::unique_lock<std::mutex>& lock) {
     if (imm_ != nullptr) {
       // A flush is already outstanding; writes have to wait rather than let an
       // unbounded number of memtables pile up in memory.
+      const auto stall_start = std::chrono::steady_clock::now();
       if (options_.background_compaction) {
         bg_cv_.wait(lock);
-        continue;
+      } else {
+        const Status s = DrainBackgroundWork(lock);
+        if (!s.ok()) return s;
       }
-      const Status s = DrainBackgroundWork(lock);
-      if (!s.ok()) return s;
+      ++stats_.write_stalls;
+      stats_.write_stall_micros += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - stall_start)
+              .count());
       continue;
     }
 

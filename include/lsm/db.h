@@ -109,6 +109,11 @@ struct DbStats {
   // step over -- shadowed versions, tombstones, and versions newer than the
   // snapshot -- to produce `scan_entries_returned` live rows. The ratio is the
   // read amplification a range scan actually pays.
+  // Writes that had to wait for a memtable flush, and the total time spent
+  // waiting. Non-zero means compaction is not keeping up with the write rate.
+  uint64_t write_stalls = 0;
+  uint64_t write_stall_micros = 0;
+
   uint64_t scan_entries_returned = 0;
   uint64_t scan_entries_skipped = 0;
 

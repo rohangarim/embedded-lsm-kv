@@ -99,7 +99,7 @@ class LsmEngine : public Engine {
 
   std::string CounterReport() const override {
     const lsm::DbStats stats = db_->GetStats();
-    char buf[1024];
+    char buf[1536];
     std::snprintf(
         buf, sizeof(buf),
         "  writes                 %llu\n"
@@ -109,6 +109,7 @@ class LsmEngine : public Engine {
         "  compactions            %llu\n"
         "  compaction in / out    %.1f MiB / %.1f MiB\n"
         "  write amplification    %.2fx\n"
+        "  write stalls           %llu (%.1f ms waiting)\n"
         "  sstable blocks read    %llu\n"
         "  bloom rejections       %llu\n"
         "  tables probed          %llu\n"
@@ -129,6 +130,7 @@ class LsmEngine : public Engine {
         (unsigned long long)stats.compactions,
         stats.compaction_input_bytes / 1048576.0,
         stats.compaction_output_bytes / 1048576.0, stats.WriteAmplification(),
+        (unsigned long long)stats.write_stalls, stats.write_stall_micros / 1000.0,
         (unsigned long long)stats.sstable_blocks_read,
         (unsigned long long)stats.bloom_rejections,
         (unsigned long long)stats.tables_probed,
