@@ -1,14 +1,12 @@
 # lsmtree
 
-An embedded key-value store in C++17, built to understand how storage engines
-actually work. It's a library you link into a program — you call `Put` and
-`Get`, and it guarantees that if the machine dies a millisecond after `Put`
-returns, the data is still there when you restart. Roughly what sits underneath
-SQLite, LevelDB, or Cassandra.
+A small embedded key-value store in C++17. You link it into a program and call
+`Put` and `Get`; if the machine dies right after `Put` returns, the data is
+still there on restart. It's the same idea as LevelDB or what sits under
+Cassandra, written from scratch so I'd understand how it really works.
 
-No dependencies beyond the standard library and POSIX. GoogleTest is fetched by
-CMake for tests only; zlib is used for compression if CMake finds it, and
-everything works without it.
+No dependencies beyond the standard library and POSIX (GoogleTest is fetched
+for tests, zlib is optional).
 
 ```cpp
 #include "lsm/db.h"
@@ -19,159 +17,81 @@ lsm::DB::Open(lsm::Options(), "/var/data/mydb", &db);
 db->Put(lsm::WriteOptions(), "user:1", "alice");
 
 std::string value;
-if (db->Get(lsm::ReadOptions(), "user:1", &value).ok()) { /* "alice" */ }
+db->Get(lsm::ReadOptions(), "user:1", &value);
 
-// Several writes, applied atomically: after a crash, all of it or none.
-lsm::WriteBatch batch;
+lsm::WriteBatch batch;           // all of it or none of it, even across a crash
 batch.Put("user:2", "bob");
 batch.Delete("user:1");
 db->Write(lsm::WriteOptions(), batch);
 
-// Sorted scan over live keys.
-for (auto it = db->NewIterator(lsm::ReadOptions()); it->SeekToFirst(), it->Valid();
-     it->Next()) {
-  // it->key(), it->value()
-}
+auto it = db->NewIterator(lsm::ReadOptions());   // sorted, forward or backward
+for (it->SeekToFirst(); it->Valid(); it->Next()) { /* it->key(), it->value() */ }
 ```
-
-## Building
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build
-ctest --test-dir build --output-on-failure   # 197 tests
+cmake --build build && ctest --test-dir build   # 197 tests
 ```
 
-## The idea
+## How it works
 
-Disks hate random writes. Storing data as a tree on disk means an update in the
-middle costs a seek and a full page rewrite — for a 100-byte value. An LSM tree
-refuses to write into the middle of anything:
+Random writes are slow on disk, so an LSM tree never writes into the middle of
+anything. A `Put` appends to a log and goes into an in-memory skip list. When
+that fills up it's written out as one immutable sorted file, and a background
+thread keeps merging files so reads don't have to check too many of them.
+Deletes write a tombstone, since the old value may still sit in an older file.
 
-```
-Put(key, value)
-  |-- append one record to the write-ahead log   <- sequential, the fastest thing a disk does
-  |-- insert into an in-memory sorted skip list
-  '-- return
+What's in the box: a skip-list memtable, a write-ahead log with CRC checks and
+group commit, SSTables with prefix-compressed blocks and Bloom filters, a
+sharded block cache, leveled compaction, snapshots, an append-only manifest,
+optional compression, and write backpressure when compaction falls behind.
 
-memtable fills up
-  '-- write it out as one immutable SSTable, start over
+## How well it works
 
-files pile up and reads slow down
-  '-- a background thread merges them into fewer, bigger files
-```
+Measured on an Apple M4, 500K keys, 100-byte values, buffered writes
+(`sync=never`), checksums on. Raw output is in `results/` and every figure is
+checked in [`VERIFIED_NUMBERS.md`](VERIFIED_NUMBERS.md).
 
-That's the whole trade: writes get fast, reads get slower, and background
-merging (compaction) is the rent you pay. Compaction is where most of the
-difficulty lives — it's also what reclaims space from overwrites and finalises
-deletes.
+| Workload | ops/sec |
+|---|---:|
+| load (inserts) | ~430K |
+| 50% read / 50% update | ~460K |
+| 95% read | ~860K |
+| 100% read | ~1.15M |
+| scan | ~150K |
 
-Two details that everything else falls out of:
+Against LevelDB on the same workloads it wins on the mixed ones, is about even
+on reads, and loses on pure inserts and scans (scans are around 0.6x). LevelDB's
+numbers swing a lot between runs, so I won't quote an exact ratio.
 
-**Every key carries an 8-byte trailer** of `(sequence << 8 | type)`. Keys sort
-by user key ascending, then sequence *descending*, so the newest version of a
-key is the first one a forward scan meets. Point lookups, snapshot reads, and
-compaction's shadowed-version filter all drop out of that single ordering.
+- **Bloom filters:** 1.23% false positives at 10 bits/key, measured over a
+  million lookups of keys that aren't there.
+- **Crash testing:** a harness kills the writer with `SIGKILL` at random moments
+  and checks that every acknowledged write survives and nothing is half-written.
+  300 of 300 rounds passed. That proves process-crash safety, not power loss.
+- Clean under AddressSanitizer, UBSan and ThreadSanitizer, run in CI.
 
-**A delete doesn't delete.** It writes a tombstone, because the real value may
-still sit in an older file. Only compaction can drop both together.
+## Things the tests taught me
 
-## What's in it
+- **A durability bug the crash harness found:** compaction recorded the wrong
+  log in the manifest, so cleanup could delete a log that still held
+  acknowledged writes.
+- **Slow reads weren't what I thought:** I fixed allocation and lock contention
+  and nothing moved. It was checksumming every 4 KiB block a byte at a time;
+  using the CPU's CRC instruction took reads from 264K to 1.2M ops/sec.
+- **Scans were 0.07x:** flushing a memtable kept every old version of a hot key,
+  so a scan stepped over ~41 dead entries per row. Collapsing versions at flush
+  time like compaction does took scans from 19K to 151K.
 
-| | |
-|---|---|
-| Skip-list memtable | Single writer, lock-free readers — insertion publishes pointers, never rotates |
-| Write-ahead log | CRC-32C per record, three fsync policies, group commit |
-| SSTables | Data blocks + sparse index + Bloom filter + footer |
-| Data blocks | Prefix compression with restart points |
-| Bloom filters | 1.23% false positives measured at 10 bits/key |
-| Block cache | Sharded LRU over decoded blocks |
-| Compaction | Leveled, 7 levels at 10× growth, with L0 write backpressure |
-| Snapshots | Pinned read sequence; also gates what compaction may discard |
-| Manifest | Append-only edit log, ~115 bytes per commit regardless of database size |
-| Compression | Optional, off by default — built-in LZ77 or zlib |
+## Not done
 
-## Performance
-
-Benchmarked against LevelDB — Google's production engine and the reference
-implementation of this design — on identical YCSB-style workloads, matched
-settings, back to back on an idle machine. Checksum verification is **on** here
-while LevelDB's default leaves it off, so this is the harder configuration.
-
-| Workload | lsmtree | LevelDB | |
-|---|---:|---:|---|
-| load (100% insert) | 432 065 | 499 547 | 0.87x |
-| A (50% read / 50% update) | **464 655** | 222 640 | **2.09x** |
-| B (95% read) | **862 548** | 710 916 | **1.21x** |
-| C (100% read) | 1 149 186 | 1 210 596 | 0.95x |
-| D (read latest) | 1 157 849 | 1 294 580 | 0.89x |
-| E (scan) | 150 267 | 241 630 | 0.62x |
-| F (read-modify-write) | **392 766** | 243 388 | **1.61x** |
-
-Ops/sec, 500 000 keys, 100-byte values. On-disk size is 57 MiB for both.
-
-One caveat on workload A: LevelDB's number for it swings between runs (222–285K
-across mine), and this table caught it on a low one. Against its best A the
-ratio is closer to 1.6x than 2.1x.
-
-Scans are the one real gap. Positioning a cursor in every level is inherent to a
-range scan in an LSM tree, and profiling says the remaining difference is spread
-across per-level work rather than any single thing worth fixing.
-
-## Crash testing
-
-The part I'd point at first. A harness spawns a writer, kills it with `SIGKILL`
-at a random moment, restarts, and checks two things: every write the engine
-returned `OK` for is readable, and the recovered keys form a contiguous prefix —
-no holes, and nothing past the last complete record. It runs a few hundred
-rounds across all three fsync policies, and also tears WAL records deliberately.
+- Writers queue behind a single leader (group commit shares the fsync, but
+  doesn't parallelize).
+- Scans are still slower than LevelDB's.
+- Compression is off by default because it costs about a third of read speed.
 
 ```
-300/300 rounds passed; 298 killed by signal mid-operation
-RESULT: PASS -- every acknowledged write survived every crash
-```
-
-Plus 197 unit and integration tests, clean under AddressSanitizer and
-ThreadSanitizer, all running in CI.
-
-## Three things worth reading the code for
-
-**A durability bug the harness found.** Compaction wrote the manifest naming the
-*active* log. If a memtable rotation happened during the compaction's unlocked
-window, cleanup would delete a log that still held acknowledged writes. 34 of
-300 rounds lost exactly one memtable's worth of data. Fixed by naming the oldest
-log recovery still needs.
-
-**Reads were slow for a reason I guessed wrong twice.** Point-read p95 sat at a
-flat ~11 µs. It wasn't allocation and it wasn't lock contention — I fixed both
-and nothing moved. It was checksum verification: a byte-at-a-time CRC over every
-4 KiB block. Switching to the CPU's CRC32C instruction took reads from 264K to
-1.2M ops/sec, with verification still on.
-
-**Scans were 0.07x, and the iterator was innocent.** Counting dead entries
-stepped over per live row returned gave 41. The engine was hoarding versions:
-compaction collapsed each key to its newest, but flushing a memtable dumped
-every version verbatim, and a 4 MiB memtable under skewed updates holds
-thousands of versions of its hottest keys. Applying compaction's own rule to the
-flush took scans from 19K to 151K ops/sec.
-
-The pattern in all three: measure the specific quantity rather than reason about
-the plausible cause.
-
-## Known gaps
-
-- **Scans at 0.62x.** Diagnosed, not a single fixable thing.
-- **Writers serialize.** Group commit shares the fsync, but they still queue
-  behind the leader rather than proceeding in parallel.
-- **Compression costs a third of read throughput**, so it stays off by default.
-  A production LZ4 or Snappy would be a drop-in behind the existing interface.
-
-## Layout
-
-```
-include/lsm/   public headers
-src/           implementation
-tests/         GoogleTest suite
-bench/         YCSB-style benchmark, and the LevelDB adapter
-tools/         crash harness and its worker process
+include/lsm/  public headers      tests/  GoogleTest suite
+src/          implementation      bench/  YCSB-style benchmark + LevelDB adapter
+results/      raw benchmark output tools/  crash harness
 ```
